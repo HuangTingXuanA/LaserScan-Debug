@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/home/htx/CursorItem/LaserMatch/build",
+  "command": "/usr/bin/c++ -DTBB_USE_DEBUG -I/home/htx/CursorItem/LaserMatch/include -I/usr/local/cuda/targets/x86_64-linux/include -isystem /usr/local/include/opencv4  -g -O0 -fopenmp -fno-omit-frame-pointer -g -o CMakeFiles/LaserCalib.dir/src/laser.cpp.o -c /home/htx/CursorItem/LaserMatch/src/laser.cpp",
+  "file": "/home/htx/CursorItem/LaserMatch/src/laser.cpp",
+  "output": "CMakeFiles/LaserCalib.dir/src/laser.cpp.o"
+},
+{
+  "directory": "/home/htx/CursorItem/LaserMatch/build",
+  "command": "/usr/bin/c++ -DTBB_USE_DEBUG -I/home/htx/CursorItem/LaserMatch/include -I/usr/local/cuda/targets/x86_64-linux/include -isystem /usr/local/include/opencv4  -g -O0 -fopenmp -fno-omit-frame-pointer -g -o CMakeFiles/LaserCalib.dir/src/main.cpp.o -c /home/htx/CursorItem/LaserMatch/src/main.cpp",
+  "file": "/home/htx/CursorItem/LaserMatch/src/main.cpp",
+  "output": "CMakeFiles/LaserCalib.dir/src/main.cpp.o"
+}
+]

@@ -1,0 +1,39 @@
+{
+    "configurations": [
+        {
+            "name": "Linux-GCC",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/local/include/opencv4",
+                "/usr/local/cuda/include",
+                "/usr/include/pcl-1.14",
+                "/usr/include/eigen3"
+            ],
+            "defines": [
+                "DEBUG"
+            ],
+            "compilerPath": "/usr/bin/g++",
+            "cStandard": "gnu17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        },
+        {
+            "name": "Linux-CUDA",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/local/include/opencv4",
+                "/usr/local/cuda/include",
+                "/usr/include/eigen3"
+            ],
+            "defines": [
+                "__CUDACC__",
+                "__CUDA_ARCH__=860",
+                "DEBUG"
+            ],
+            "compilerPath": "/usr/local/cuda/bin/nvcc",
+            "intelliSenseMode": "linux-gcc-x64",
+            "configurationProvider": "ms-vscode.cmake-tools"
+        }
+    ],
+    "version": 4
+}
