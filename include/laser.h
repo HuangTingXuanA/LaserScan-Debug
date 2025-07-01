@@ -62,12 +62,25 @@ struct ScoreAccumulator {
 };
 
 struct PlaneMatchResult {
-    int plane_idx; // 平面索引
+    int plane_idx = -1; // 平面索引
     int point_count = 0; // 有效点数量（重投影在图像内的点数）
     int best_r_idx = -1; // 最佳匹配的右激光线索引
     float avg_score = -FLT_MAX; // 最佳匹配的平均得分
     std::vector<ReprojectionInfo> reprojected_points; // 所有重投影点信息
     std::map<int, ScoreAccumulator> r_line_scores; // 右激光线索引 -> 分数累计
+};
+
+// 新增匹配策略相关数据结构
+struct CandidateMatch {
+    int plane_idx;
+    int r_laser_idx;
+    float avg_score;
+    float score_gap; // 与次优候选的得分差距
+};
+
+struct UnmatchedInfo {
+    int l_laser_idx = -1;
+    std::vector<CandidateMatch> candidates;
 };
 
 
@@ -99,10 +112,21 @@ public:
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l, const cv::Mat& rectify_r);
     
-    void match3(
+    std::vector<std::tuple<int, int, int>> match3(
         const std::vector<std::map<float, float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l, const cv::Mat& rectify_r);
+
+    std::vector<cv::Point3f> generateCloudPoints(
+        const std::vector<std::tuple<int, int, int>>& laser_match,
+        const std::vector<LaserLine> laser_l,
+        const std::vector<LaserLine> laser_r);
+
+
+
+
+
+
     cv::Vec2f computePrincipalDirection(const std::vector<cv::Point2f>& pts);
     float orientationScore(const cv::Vec2f& v1, const cv::Vec2f& v2);
     float dtwScore(const std::vector<float>& seq1, const std::vector<float>& seq2);

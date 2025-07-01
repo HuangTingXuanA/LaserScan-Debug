@@ -11,7 +11,7 @@ using ImageVec = std::vector<std::tuple<cv::Mat, cv::Mat, cv::Mat, cv::Mat>>;
 
 std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
 fs::path calib_info_dir_ = fs::current_path() / "calib_info";
-fs::path laser_imgs_dir_ = fs::current_path() / "laser_0701_2";
+fs::path laser_imgs_dir_ = fs::current_path() / "laser_0701_4";
 fs::path output_dir_ = fs::current_path() / "cloud";
 fs::path debug_img_dir = fs::current_path() / "debug_img";
 

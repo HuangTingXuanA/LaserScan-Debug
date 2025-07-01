@@ -3,11 +3,29 @@
 #include "laser.h"
 #include <iostream>
 #include <fstream>
+std::vector<std::pair<cv::Mat, cv::Mat>> loadImages() {
+    std::vector<std::pair<cv::Mat, cv::Mat>> imgs;
+    for (int i = 2; i <= 7; i++) {
+        std::string dir = "track_0701/" + std::to_string(i);
+        std::string img_l_file = dir + "/image1.bmp";
+        std::string img_r_file = dir + "/image2.bmp";
+
+        cv::Mat img_l = cv::imread(img_l_file, cv::IMREAD_GRAYSCALE);
+        cv::Mat img_r = cv::imread(img_r_file, cv::IMREAD_GRAYSCALE);
+        if (img_l.empty() || img_r.empty()) {
+            throw std::logic_error("Failed to load laser images");
+        }
+        imgs.emplace_back(img_l, img_r);
+
+    }
+    return imgs;
+}
 
 int main() {
 
-    loadImgs();
-    
+    // loadImgs();
+    auto imgs_vec = loadImages();
+
     bool is_load = loadStereoCalibInfo();
     if (!is_load) throw std::logic_error("can't load stereo calib info");
     is_load = loadQuadSurfaceInfo();
@@ -15,9 +33,9 @@ int main() {
 
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
-    for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
+    for (size_t img_idx = 0; img_idx < imgs_vec.size(); ++img_idx) {
         cv::Mat img_l, img_r;
-        std::tie(img_l, img_r) = laser_imgs_[img_idx];
+        std::tie(img_l, img_r) = imgs_vec[img_idx];
         auto rectify_imgs_have_laser = getEpipolarRectifyImage(
             img_l,
             img_r
@@ -114,8 +132,18 @@ int main() {
             sample_points_l[idx] = mmp;
         }
 
-        // 重投影到右图
-        laser_processor.match2(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        // 重投影到右图（l_idx, plane_idx, r_idx）
+        auto match_vec_tuple = laser_processor.match3(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+
+        // 同名点匹配
+        auto cloud_points = laser_processor.generateCloudPoints(match_vec_tuple, laser_l, laser_r);
+
+        std::string txt_file = std::to_string(2 + img_idx);
+        std::ofstream ofs(txt_file + ".txt");
+        for (const auto& pt : cloud_points) {
+            ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
+        }
+        ofs.close();
     }
 
     return 0;
