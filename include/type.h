@@ -5,6 +5,7 @@
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudafilters.hpp>
 #include <opencv2/cudaarithm.hpp>
+#include <tuple>
 
 // 双目标定将结果
 struct CalibrationResult {
@@ -73,4 +74,10 @@ struct Plane {
         float norm = cv::norm(normal);
         return (norm > 1e-6) && (std::abs(normal[0]) > 1e-6 || std::abs(normal[1]) > 1e-6);
     }
+};
+
+// 激光曲面标定结果
+struct QuadSurface {
+    cv::Mat coefficients;  // 6x1的系数矩阵 [a, b, c, d, e, f]
+    float rmse = 0.0;      // 曲面拟合的均方根误差
 };

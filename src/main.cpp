@@ -4,38 +4,13 @@
 #include <iostream>
 #include <fstream>
 
-// std::vector<cv::Point3f> loadVecPoint3f(std::string filename)
-// {
-//     std::vector<cv::Point3f> vec_points;
-// std::fstream fsread(filename);
-//  std::string buf_str;
-//  while (std::getline(fsread, buf_str))
-//  {
-//   std::stringstream ss(buf_str);
-//   if (!ss.eof())
-//   {
-//    float x, y, z;
-//    ss >> x >> y >> z;
-//    vec_points.emplace_back(x, y, z);
-//   }
-//   buf_str.clear();
-//   ss.clear();
-//  }
-//  const bool bOk = !fsread.bad();
-//  fsread.close();
-//  return vec_points;
-// }
-
 int main() {
 
     loadImgs();
     
     bool is_load = loadStereoCalibInfo();
     if (!is_load) throw std::logic_error("can't load stereo calib info");
-    std::string yml_file = (calib_info_dir_ / "laser_calib.yml").string();
-    std::vector<Plane> planes_info;
-    is_load = loadPlaneCalibInfo(yml_file, planes_info);
-    ConfigManager::getInstance().setPlane(planes_info);
+    is_load = loadQuadSurfaceInfo();
     if (!is_load) throw std::logic_error("can't load planes calib info");
 
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
@@ -44,8 +19,8 @@ int main() {
         cv::Mat img_l, img_r;
         std::tie(img_l, img_r) = laser_imgs_[img_idx];
         auto rectify_imgs_have_laser = getEpipolarRectifyImage(
-            processImg(img_l, 0, true),
-            processImg(img_r, 1, true)
+            img_l,
+            img_r
         );
         calib_info = ConfigManager::getInstance().getCalibInfo();
 
@@ -84,7 +59,10 @@ int main() {
         cv::imwrite(debug_img_dir / ("roiImg_l" + std::to_string(img_idx) + ".jpg"), roi_img_l);
         cv::imwrite(debug_img_dir / ("roiImg_r" + std::to_string(img_idx) + ".jpg"), roi_img_r);
 
+
         // 激光线中心点提取
+        rectify_imgs_have_laser[0] = processImg(rectify_imgs_have_laser[0], 0, true);
+        rectify_imgs_have_laser[1] = processImg(rectify_imgs_have_laser[1], 1, true);
         LaserProcessor laser_processor;
         cv::Mat laser_img_l = rectify_imgs_have_laser[0].clone();
         cv::Mat laser_img_r = rectify_imgs_have_laser[1].clone();
@@ -123,6 +101,12 @@ int main() {
         //     }
         //     return result;
         // };
+
+
+        sort(laser_l.begin(), laser_l.end(), [](const auto& l1, const auto& l2){
+            return l1.points.size() > l2.points.size();
+        });
+
         for (size_t idx = 0; idx < laser_l.size(); ++idx) {
             std::map<float, float> mmp;
             for (const auto& p : laser_l[idx].points)
@@ -130,9 +114,8 @@ int main() {
             sample_points_l[idx] = mmp;
         }
 
-
         // 重投影到右图
-        laser_processor.match(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        laser_processor.match2(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
     }
 
     return 0;

@@ -11,7 +11,7 @@ using ImageVec = std::vector<std::tuple<cv::Mat, cv::Mat, cv::Mat, cv::Mat>>;
 
 std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
 fs::path calib_info_dir_ = fs::current_path() / "calib_info";
-fs::path laser_imgs_dir_ = fs::current_path() / "laser_img";
+fs::path laser_imgs_dir_ = fs::current_path() / "laser_0701_2";
 fs::path output_dir_ = fs::current_path() / "cloud";
 fs::path debug_img_dir = fs::current_path() / "debug_img";
 
@@ -52,10 +52,12 @@ void loadImgs() {
     }
 }
 
-bool loadPlaneCalibInfo(const std::string& filepath, std::vector<Plane>& planes) {
+bool loadPlaneCalibInfo() {
+    fs::path filepath = calib_info_dir_ / "laser_calib.yml";
     cv::FileStorage fs(filepath, cv::FileStorage::READ);
     if (!fs.isOpened()) return false;
 
+    std::vector<Plane> planes;
     int plane_count = 0;
     fs["plane_count"] >> plane_count;
     cv::FileNode planes_node = fs["planes"];
@@ -71,7 +73,10 @@ bool loadPlaneCalibInfo(const std::string& filepath, std::vector<Plane>& planes)
         planes.push_back(plane);
     }
     fs.release();
-    return planes.size() == static_cast<size_t>(plane_count);
+    
+    ConfigManager::getInstance().setPlane(planes);
+
+    return true;
 }
 
 bool loadStereoCalibInfo() {
@@ -121,6 +126,32 @@ bool loadStereoCalibInfo() {
 
     return true;
 }
+
+bool loadQuadSurfaceInfo() {
+    fs::path filepath = calib_info_dir_ / "quad_surface.yml";
+    cv::FileStorage fs(filepath, cv::FileStorage::READ);
+    if (!fs.isOpened()) return false;
+
+    std::vector<QuadSurface> surfaces;
+    int surface_count = 0;
+    fs["surface_count"] >> surface_count;
+    
+    cv::FileNode surfaces_node = fs["surfaces"];
+    if (surfaces_node.type() != cv::FileNode::SEQ) return false;
+    
+    for (auto it = surfaces_node.begin(); it != surfaces_node.end(); ++it) {
+        QuadSurface surface;
+        (*it)["coefficients"] >> surface.coefficients;
+        (*it)["rmse"] >> surface.rmse;
+        surfaces.push_back(surface);
+    }
+    fs.release();
+    
+    ConfigManager::getInstance().setQuadSurfaces(surfaces);
+
+    return true;
+}
+
 
 cv::Mat getGaussImgOnly(const cv::Mat& img, const int& n,
     const double& gsigma, const int& border) {
@@ -198,9 +229,7 @@ cv::Mat getGaussImgOnly(const cv::Mat& img, const int& n,
 
 }
 
-cv::Mat processImg(const cv::Mat& img_origin, int is_left, bool have_laser) {
-    // 获取标定参数（线程安全读取）
-    const auto& params = ConfigManager::getInstance().getCalibInfo();
+cv::Mat processImg(const cv::Mat& img_origin, int is_right, bool have_laser) {
     
     // 灰度转换
     cv::Mat gray_img;
@@ -210,14 +239,9 @@ cv::Mat processImg(const cv::Mat& img_origin, int is_left, bool have_laser) {
         gray_img = img_origin.clone();
     }
 
-    // 畸变校正
-    cv::Mat undistorted_img;
-    cv::undistort(gray_img, undistorted_img, 
-                params.camera_matrix[is_left], params.dist_coeffs[is_left]);
-
     // 数据类型转换
     cv::Mat img_float;
-    undistorted_img.convertTo(img_float, CV_32F);
+    gray_img.convertTo(img_float, CV_32F);
 
 
     // 使用自定义的高斯处理方法

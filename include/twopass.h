@@ -60,7 +60,7 @@ void LabelColor(const cv::Mat& labelImg, cv::Mat& colorLabelImg)
 void Two_PassNew(const cv::Mat &img, cv::Mat &labImg)
 {
     cv::Mat bwImg;
-    cv::threshold(img, bwImg, 100, 255, cv::THRESH_BINARY);
+    cv::threshold(img, bwImg, 150, 255, cv::THRESH_BINARY);
 	assert(bwImg.type() == CV_8UC1);
 	labImg.create(bwImg.size(), CV_32SC1);   //bwImg.convertTo( labImg, CV_32SC1 );
 	labImg = cv::Scalar(0);
@@ -140,6 +140,7 @@ void Two_PassNew(const cv::Mat &img, cv::Mat &labImg)
 	}
 }
 
+
 std::vector<cv::RotatedRect> DetectLaserRegions(cv::Mat& labImg) {
     std::vector<cv::RotatedRect> laserRects;
     if (labImg.empty() || labImg.type() != CV_32SC1)
@@ -148,7 +149,7 @@ std::vector<cv::RotatedRect> DetectLaserRegions(cv::Mat& labImg) {
     // 特征过滤阈值（根据实际场景调整）
     const int MIN_AREA = 50;          // 最小像素面积
     const float MIN_ASPECT = 8.0f;    // 最小长宽比
-    const float MAX_WIDTH = 45.0f;    // 最大宽度
+    // const float MAX_WIDTH = 45.0f;    // 最大宽度
 	const float WIDTH_EXPAND = 4.5f;   // 宽度扩展像素数
 	const float MIN_LENGTH = 50.0f;
 
@@ -178,7 +179,7 @@ std::vector<cv::RotatedRect> DetectLaserRegions(cv::Mat& labImg) {
 
         // 激光线判断条件
         if (aspect > MIN_ASPECT && 
-            width < MAX_WIDTH &&
+            // width < MAX_WIDTH &&
 			height > MIN_LENGTH) {
 
 			// 扩展旋转矩形尺寸

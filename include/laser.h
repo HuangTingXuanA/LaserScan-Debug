@@ -44,6 +44,33 @@ struct Center {
     cv::Vec2f dir;  // 局部方向，必须保证 dir[1] != 0
 };
 
+// 平面匹配结果结构
+struct ReprojectionInfo {
+    float x_left;   // 左图像点x坐标
+    float y_left;   // 左图像点y坐标
+    float x_right;  // 右图像重投影x坐标
+    float y_right;  // 右图像重投影y坐标
+    std::map<int, float> r_scores; // 右激光线索引 -> 匹配得分
+    
+    ReprojectionInfo(float x, float y, float rx, float ry) 
+        : x_left(x), y_left(y), x_right(rx), y_right(ry) {}
+};
+
+struct ScoreAccumulator {
+    float score_sum = 0;
+    int count = 0;
+};
+
+struct PlaneMatchResult {
+    int plane_idx; // 平面索引
+    int point_count = 0; // 有效点数量（重投影在图像内的点数）
+    int best_r_idx = -1; // 最佳匹配的右激光线索引
+    float avg_score = -FLT_MAX; // 最佳匹配的平均得分
+    std::vector<ReprojectionInfo> reprojected_points; // 所有重投影点信息
+    std::map<int, ScoreAccumulator> r_line_scores; // 右激光线索引 -> 分数累计
+};
+
+
 class LaserProcessor {
 public:
     LaserProcessor() = default;
@@ -61,6 +88,28 @@ public:
         const std::vector<std::map<float, float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l, const cv::Mat& rectify_r);
+    
+
+    double evaluateQuadSurf(const cv::Mat &Coeff6x1, const cv::Point3f &p);
+    double evaluateQuadSurf(const cv::Mat& Coeff6x1, const std::vector<cv::Point3f>& points);
+    std::vector<cv::Point3f> findIntersection(const cv::Point3f &point, const cv::Point3f &normal,
+                                          const cv::Mat &Coeff6x1);
+    void match2(
+        const std::vector<std::map<float, float>>& sample_points,
+        const std::vector<LaserLine>& laser_r,
+        const cv::Mat& rectify_l, const cv::Mat& rectify_r);
+    
+    void match3(
+        const std::vector<std::map<float, float>>& sample_points,
+        const std::vector<LaserLine>& laser_r,
+        const cv::Mat& rectify_l, const cv::Mat& rectify_r);
+    cv::Vec2f computePrincipalDirection(const std::vector<cv::Point2f>& pts);
+    float orientationScore(const cv::Vec2f& v1, const cv::Vec2f& v2);
+    float dtwScore(const std::vector<float>& seq1, const std::vector<float>& seq2);
+
+    void LabelColor(const cv::Mat& labelImg, cv::Mat& colorLabelImg);
+    void Two_PassNew(const cv::Mat &img, cv::Mat &labImg);
+    cv::Scalar GetRandomColor();
 
 private:
     float roi_scale_ = 1.05f;
