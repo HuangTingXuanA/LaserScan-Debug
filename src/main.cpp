@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        // if (img_idx != 11) continue;
+        // if (img_idx != 19) continue;
         
         cv::Mat img_l, img_r;
         std::tie(img_l, img_r) = laser_imgs_[img_idx];
@@ -27,6 +27,8 @@ int main() {
             img_r
         );
         calib_info = ConfigManager::getInstance().getCalibInfo();
+        rectify_imgs_have_laser[0] = processImg(rectify_imgs_have_laser[0], 0, true);
+        rectify_imgs_have_laser[1] = processImg(rectify_imgs_have_laser[1], 1, true);
 
         // 生成连通区域
         cv::Mat label_img_l, label_img_r;
@@ -65,13 +67,11 @@ int main() {
 
 
         // 激光线中心点提取
-        rectify_imgs_have_laser[0] = processImg(rectify_imgs_have_laser[0], 0, true);
-        rectify_imgs_have_laser[1] = processImg(rectify_imgs_have_laser[1], 1, true);
         LaserProcessor laser_processor;
         cv::Mat laser_img_l = rectify_imgs_have_laser[0].clone();
         cv::Mat laser_img_r = rectify_imgs_have_laser[1].clone();
-        auto laser_l = laser_processor.extractLine(roi_l, laser_img_l);
-        auto laser_r = laser_processor.extractLine(roi_r, laser_img_r);
+        auto laser_l = laser_processor.extractLine(roi_l, laser_img_l, label_img_l);
+        auto laser_r = laser_processor.extractLine(roi_r, laser_img_r, label_img_r);
         cv::cvtColor(laser_img_l, laser_img_l, cv::COLOR_GRAY2BGR);
         cv::cvtColor(laser_img_r, laser_img_r, cv::COLOR_GRAY2BGR);
         for (const auto& l : laser_l)

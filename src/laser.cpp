@@ -590,9 +590,14 @@ float LaserProcessor::findSymmetricCenter3(
     cv::namedWindow("GrayProfile", cv::WINDOW_NORMAL);
 #endif
 
+    float extend_range = R;
+    if (R < 5) extend_range += extend_range * 0.8f;
+    else if (R < 10) extend_range += extend_range * 0.7f;
+    else if (R > 10) extend_range += 5.0f;
+
     // 1. 全范围采样
     std::vector<float> Ts, Vs;
-    for (float t = -0.5f; t <= R; t += step) {
+    for (float t = -2.5f; t <= extend_range; t += step) {
         Ts.push_back(t);
         Vs.push_back(interpolateChannel(img, x + t*dir[0], y + t*dir[1]));
     }
@@ -600,26 +605,19 @@ float LaserProcessor::findSymmetricCenter3(
     if (N < 3) return FLT_MAX;
 
     // 2. 找到第一个峰值
+    float maxVal = -FLT_MAX;
     int peakIdx = -1;
     bool isRising = false;
-    for (int i = 1; i < N; ++i) {
-        if (Vs[i] > Vs[i-1]) {
-            // 检测到上升趋势
-            isRising = true;
-        } else if (isRising && (Vs[i] - Vs[i-1] < -1e-3f)) {
-            // 上升后首次出现下降，找到第一个峰
-            peakIdx = i-1;
-            break;
+    for (int i = 0; i < N; ++i) {
+        // 只考虑 0 <= t <= R 的点
+        if (Vs[i] > maxVal && Ts[i] <= R) {
+            maxVal = Vs[i];
+            peakIdx = i;
         }
-    }
-    // 处理特殊情况
-    if (peakIdx == -1) {
-        if (isRising) peakIdx = N-1;    // 全程上升无下降：最后一个点为峰
-        else peakIdx = 0;               // 全程下降：第一个点为峰
     }
     float t_peak = Ts[peakIdx];
 
-    // 确定第一个峰的下降沿边界（向右搜索）
+    // 确定第一个最大峰的下降沿边界（向右搜索）
     int rightBound = peakIdx + 1;  // 初始化为峰顶位置
     while (rightBound < N) {
         // 检测灰度值上升：表示下降沿结束
@@ -636,7 +634,7 @@ float LaserProcessor::findSymmetricCenter3(
         int L = peakIdx, Rg = peakIdx;
         while (L>0 && std::fabs(Vs[L-1]-v0)<1e-4f) --L;
         while (Rg+1<rightBound && std::fabs(Vs[Rg+1]-v0)<1e-4f) ++Rg;
-        if (Rg - L + 1 > 8) {
+        if (Rg - L + 1 > 3) {
             res1 = 0.5f*(Ts[L] + Ts[Rg]);
         }
     }
@@ -712,7 +710,7 @@ float LaserProcessor::findSymmetricCenter3(
                 float b = coeff.at<float>(1, 0);
                 if (a < 0) {  // 确保是开口向下的抛物线
                     float tp = -b / (2 * a);
-                    if (tp >= -R && tp <= R) {
+                    if (tp >= -extend_range && tp <= extend_range) {
                         res2 = tp;
                     }
                 }
@@ -748,8 +746,8 @@ float LaserProcessor::findSymmetricCenter3(
     // 2) 刻度与标签
     int n_xt = 5;
     for (int i = 0; i <= n_xt; ++i) {
-        float t_tick = -R + 2*R * i / n_xt;
-        int xt = x0 + int((t_tick + R)/(2*R)*(x1 - x0));
+        float t_tick = -extend_range + 2*extend_range * i / n_xt;
+        int xt = x0 + int((t_tick + extend_range)/(2*extend_range)*(x1 - x0));
         cv::line(prof_img, {xt, y0-5}, {xt, y0+5}, {0,0,0},1);
         cv::putText(prof_img, cv::format("%.2f", t_tick),
                     {xt-20, y0+25}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {0,0,0},1);
@@ -765,11 +763,11 @@ float LaserProcessor::findSymmetricCenter3(
 
     // 3) 全采样点 & 连线（灰）
     for (int i = 0; i < N; ++i) {
-        int xx = x0 + int((Ts[i]+R)/(2*R)*(x1 - x0));
+        int xx = x0 + int((Ts[i]+extend_range)/(2*extend_range)*(x1 - x0));
         int yy = y0 - int(Vs[i]*(y0 - y1));
         cv::circle(prof_img, {xx,yy}, 3, {180,180,180}, -1);
         if (i>0) {
-            int xx0 = x0 + int((Ts[i-1]+R)/(2*R)*(x1 - x0));
+            int xx0 = x0 + int((Ts[i-1]+extend_range)/(2*extend_range)*(x1 - x0));
             int yy0 = y0 - int(Vs[i-1]*(y0 - y1));
             cv::line(prof_img, {xx0,yy0}, {xx,yy}, {200,200,200},1);
         }
@@ -787,7 +785,7 @@ float LaserProcessor::findSymmetricCenter3(
     int lx = W - 180, ly = 80, dy = 30;
     for (auto &r : rst) {
         if (r.t==FLT_MAX) continue;
-        int xx = x0 + int((r.t+R)/(2*R)*(x1 - x0));
+        int xx = x0 + int((r.t+extend_range)/(2*extend_range)*(x1 - x0));
         cv::line(prof_img, {xx, y1}, {xx, y0}, r.c, 1);
         cv::putText(prof_img,
             cv::format("%s: %.3f", r.lbl, r.t),
@@ -877,12 +875,15 @@ std::pair<cv::Point2f, cv::Point2f> LaserProcessor::getAxisEndpoints(const cv::R
     return std::make_pair(mid1, mid2);
 }
 
-std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::RotatedRect>& rois, const cv::Mat& rectify_img) {
+std::vector<LaserLine> LaserProcessor::extractLine(
+    const std::vector<cv::RotatedRect>& rois,
+    const cv::Mat& rectify_img,
+    const cv::Mat& label_img) {
     std::vector<LaserLine> laser_lines;
     cv::Mat rectify_img_float;
     rectify_img.convertTo(rectify_img_float, CV_32F, 1.0f / 255.0f);
     
-    // 1. 整体二值化
+    // 保留全局二值化用于后续方向判断（非轮廓提取）
     cv::Mat bin;
     cv::threshold(rectify_img, bin, 80, 255, cv::THRESH_BINARY);
     
@@ -890,12 +891,11 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
         const auto& roi = rois[i];
         const auto& roi_w = std::min(roi.size.width, roi.size.height);
 
-        // 2. 获取ROI四个顶点
+        // 1. 获取ROI四个顶点
         cv::Point2f vertices[4];
         roi.points(vertices);
 
-        // 3. 创建mask
-        CV_Assert(bin.type() == CV_8UC1);
+        // 2. 创建ROI区域mask
         cv::Mat mask = cv::Mat::zeros(bin.size(), CV_8UC1);
         std::vector<cv::Point> roi_poly;
         for (int i = 0; i < 4; ++i) {
@@ -904,36 +904,55 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
                 cvRound(vertices[i].y)
             ));
         }
-        // cv::Mat bin_with_roi = bin.clone();
-        // cv::polylines(bin_with_roi, roi_poly, true, cv::Scalar(0, 255, 0), 2);
-        // for (int j = 0; j < roi_poly.size(); j++) {
-        //     cv::circle(bin_with_roi, roi_poly[j], 3, cv::Scalar(0, 0, 255), -1);
-        // }
-        // cv::imwrite("debug_img/roi_" + std::to_string(i) + "_on_bin.jpg", bin_with_roi);
         std::vector<std::vector<cv::Point>> polys = {roi_poly};
         cv::fillPoly(mask, polys, cv::Scalar(255));
 
-        // 4. 提取ROI区域
-        cv::Mat roi_bin = cv::Mat::zeros(bin.size(), bin.type());
-        bin.copyTo(roi_bin, mask);
+        // 3. 提取ROI区域内的标签图
+        cv::Mat roi_labels(label_img.size(), CV_32SC1, cv::Scalar(0));
+        label_img.copyTo(roi_labels, mask);  // 仅复制ROI区域的标签
 
-        // 5. 查找轮廓 
+        // 4. 在ROI区域内选择面积最大的连通域
+        int max_label = 0;
+        double max_area = 0.0;
+        
+        // 统计ROI内各标签面积
+        std::map<int, double> label_areas;
+        for (int r = 0; r < roi_labels.rows; ++r) {
+            const int* ptr = roi_labels.ptr<int>(r);
+            for (int c = 0; c < roi_labels.cols; ++c) {
+                int label_val = ptr[c];
+                if (label_val > 1) {  // 忽略背景(0)和未标记(1)
+                    label_areas[label_val] += 1.0;
+                }
+            }
+        }
+        
+        // 寻找最大面积的标签
+        for (const auto& [label, area] : label_areas) {
+            if (area > max_area) {
+                max_area = area;
+                max_label = label;
+            }
+        }
+        
+        // 5. 创建最大连通域的二值图像并提取轮廓
+        cv::Mat max_blob = (roi_labels == max_label);
+        max_blob.convertTo(max_blob, CV_8U, 255);  // 转换为8UC1格式
+        
         std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(roi_bin, contours, cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
-        // 可视化contour
-        cv::Mat contour_vis;
-        cv::cvtColor(rectify_img, contour_vis, cv::COLOR_GRAY2BGR);
-        cv::drawContours(contour_vis, contours, -1, cv::Scalar(0, 0, 255), 2); // 红色轮廓
-
-        // 6. 收集轮廓点
-        if (contours.empty()) throw std::logic_error("no contours found");
+        cv::findContours(max_blob, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+        
+        // 6. 收集轮廓点（后续逻辑保持不变）
+        if (contours.empty()) throw std::logic_error("no contours found in max blob");
         auto max_it = std::max_element(contours.begin(), contours.end(),
             [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
                 return a.size() < b.size();
             });
+        
+        // 7. 主轴投影区域
         std::vector<std::vector<cv::Point>> max_contour{*max_it};
-        std::vector<cv::Point2f> edge_pixels;
-        std::map<int, int> edge_maxY_map; // <x, y> 用于存储边缘点的映射
+        std::map<int, int> edge_maxY_map;
+        std::map<int, int> edge_minY_map;
         auto [p1, p2] = getAxisEndpoints(roi);
         cv::Point2f axis = p2 - p1;
         float axis_len = cv::norm(axis);
@@ -945,66 +964,53 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
             cv::Point2f vec = pt_f - p1;
             float proj = vec.dot(axis_dir);
             if (proj >= min_proj && proj <= max_proj) {
-                edge_pixels.push_back(pt);
+                // 找Y最大值
                 if (edge_maxY_map.find(pt.x) == edge_maxY_map.end())
                     edge_maxY_map[pt.x] = pt.y;
                 else if (pt.y > edge_maxY_map[pt.x])
                     edge_maxY_map[pt.x] = pt.y;
+                
+                // 找Y最小值
+                if (edge_minY_map.find(pt.x) == edge_minY_map.end())
+                    edge_minY_map[pt.x] = pt.y;
+                else if (pt.y < edge_minY_map[pt.x])
+                    edge_minY_map[pt.x] = pt.y;
             }
         }
-        // 可视化方向边缘
-        cv::Mat fix_contour_vis;
-        cv::cvtColor(rectify_img, fix_contour_vis, cv::COLOR_GRAY2BGR);
-        for (const auto& p : edge_pixels) fix_contour_vis.at<cv::Vec3b>(cv::Point(p.x, p.y)) = cv::Vec3b(0, 255, 0); // 绿色表示边缘点
 
-        // 7. 垂直剖解激光线
-        auto is_toin = [&](const cv::Point2f& pt) -> bool {
-            int x = cvRound(pt.x);
-            int y = cvRound(pt.y);
-
-            // 边界检查
-            if (y - 2 < 0 || y + 2 >= bin.rows) return false;
-
-            int val_up   = bin.at<uchar>(y - 2, x);
-            int val_down = bin.at<uchar>(y + 2, x);
-
-            // 如果往255区域为向里，往0区域为向外
-            return val_down > val_up;
-        };
+        // 8. 可视化边缘方向
         cv::Mat direct_vis;
         cv::cvtColor(rectify_img, direct_vis, cv::COLOR_GRAY2BGR);
-        for (const auto& p : edge_pixels)
-            if (is_toin(p)) direct_vis.at<cv::Vec3b>(cv::Point(p.x, p.y)) = cv::Vec3b(0, 0, 255); // 红色表示向内
-            else direct_vis.at<cv::Vec3b>(cv::Point(p.x, p.y)) = cv::Vec3b(255, 0, 0); // 蓝色表示向外
+        for (const auto& [x, y] : edge_minY_map)
+            direct_vis.at<cv::Vec3b>(cv::Point(x, y)) = cv::Vec3b(0, 0, 255); // 红色表示上边沿
+        for (const auto& [x, y] : edge_maxY_map)
+            direct_vis.at<cv::Vec3b>(cv::Point(x, y)) = cv::Vec3b(255, 0, 0); // 蓝色表示下边沿
 
         cv::Mat laser_center_vis;
         cv::cvtColor(rectify_img, laser_center_vis, cv::COLOR_GRAY2BGR);
         std::map<float, float> orign_centers;
         std::unordered_map<int ,bool> x_used;
-        for (const auto& p : edge_pixels) {
-            if (!is_toin(p) || x_used[p.x]) continue;
+        for (const auto& [x, y] : edge_minY_map) {
+            if (x_used[x]) continue;
 
-            auto it = edge_maxY_map.find(p.x);
+            auto it = edge_maxY_map.find(x);
             if (it == edge_maxY_map.end()) continue;
-            float search_range = it->second - p.y;
+            float search_range = it->second - y;
             if (search_range < 3) continue;
-            else if (search_range <= 6) search_range += search_range * 0.85f;
-            else if (search_range < 10) search_range += search_range * 0.7f;
-            else if (search_range > 10) search_range += 5.0f;
             cv::Vec2f dir(0, 1);
-            x_used[p.x] = true;
+            x_used[x] = true;
 
-            // if (i == 4 && p.x == 54)
+            // if (i == 4 && x == 54)
             //     puts("");
 
             // float t_peak = FLT_MAX;
-            // if (p.x >= 1445 && p.x <= 1448)
-            //     t_peak = findSymmetricCenter3(rectify_img_float, p.x, p.y, dir, search_range);
+            // if (x == 1018 && y == 150)
+            //     t_peak = findSymmetricCenter3(rectify_img_float, x, y, dir, search_range);
 
-            float t_peak = findSymmetricCenter3(rectify_img_float, p.x, p.y, dir, search_range);
-            // float t_peak = findSymmetricCenter2(rectify_img_float, p.x, p.y, dir, roi_w, 0);
+            float t_peak = findSymmetricCenter3(rectify_img_float, x, y, dir, search_range);
+            // float t_peak = findSymmetricCenter2(rectify_img_float, x, y, dir, roi_w, 0);
             if (t_peak == FLT_MAX || t_peak <= 0) continue;
-            float center_x = p.x + t_peak*dir[0], center_y = p.y + t_peak * dir[1];
+            float center_x = x + t_peak*dir[0], center_y = y + t_peak * dir[1];
 
             orign_centers[center_y] = center_x;
 
@@ -1015,13 +1021,13 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
 
 
 
-        // 8. 同一条线相邻中心点插值为整数
+        // 9. 同一条线相邻中心点插值为整数
         cv::Mat new_centers_vis;
         cv::cvtColor(rectify_img, new_centers_vis, cv::COLOR_GRAY2BGR);
         std::vector<cv::Point2f> new_centers = processCenters(orign_centers);
         for (const auto& p : new_centers) new_centers_vis.at<cv::Vec3b>(cv::Point(std::round(p.x), p.y)) = cv::Vec3b(0, 255, 0); // 绿色表示中心点
 
-        // 9. 存储结果
+        // 10. 存储结果
         const float laser_width = std::min(roi.size.width, roi.size.height) / roi_scale_;
         const float sigma_val = convert_to_odd_number(laser_width / (2 * std::sqrt(3.0f)));
         const float roi_angle = roi.angle * CV_PI / 180.0f;

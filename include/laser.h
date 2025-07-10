@@ -98,7 +98,7 @@ public:
 
     std::vector<cv::Point2f> processCenters(const std::map<float, float>& orign_centers);
     std::pair<cv::Point2f, cv::Point2f> getAxisEndpoints(const cv::RotatedRect& rect);
-    std::vector<LaserLine> extractLine(const std::vector<cv::RotatedRect>& rois, const cv::Mat& rectify_img);
+    std::vector<LaserLine> extractLine(const std::vector<cv::RotatedRect>& rois, const cv::Mat& rectify_img, const cv::Mat& label_img);
     
 
     double evaluateQuadSurf(const cv::Mat &Coeff6x1, const cv::Point3f &p);
