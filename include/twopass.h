@@ -140,7 +140,6 @@ void Two_PassNew(const cv::Mat &img, cv::Mat &labImg)
 	}
 }
 
-
 std::vector<cv::RotatedRect> DetectLaserRegions(cv::Mat& labImg) {
     std::vector<cv::RotatedRect> laserRects;
     if (labImg.empty() || labImg.type() != CV_32SC1)

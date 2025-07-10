@@ -3,28 +3,12 @@
 #include "laser.h"
 #include <iostream>
 #include <fstream>
-std::vector<std::pair<cv::Mat, cv::Mat>> loadImages() {
-    std::vector<std::pair<cv::Mat, cv::Mat>> imgs;
-    for (int i = 2; i <= 7; i++) {
-        std::string dir = "track_0701/" + std::to_string(i);
-        std::string img_l_file = dir + "/image1.bmp";
-        std::string img_r_file = dir + "/image2.bmp";
 
-        cv::Mat img_l = cv::imread(img_l_file, cv::IMREAD_GRAYSCALE);
-        cv::Mat img_r = cv::imread(img_r_file, cv::IMREAD_GRAYSCALE);
-        if (img_l.empty() || img_r.empty()) {
-            throw std::logic_error("Failed to load laser images");
-        }
-        imgs.emplace_back(img_l, img_r);
-
-    }
-    return imgs;
-}
 
 int main() {
 
-    // loadImgs();
-    auto imgs_vec = loadImages();
+    loadImgs();
+    // loadTrackImgs();
 
     bool is_load = loadStereoCalibInfo();
     if (!is_load) throw std::logic_error("can't load stereo calib info");
@@ -33,9 +17,11 @@ int main() {
 
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
-    for (size_t img_idx = 0; img_idx < imgs_vec.size(); ++img_idx) {
+    for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
+        // if (img_idx != 11) continue;
+        
         cv::Mat img_l, img_r;
-        std::tie(img_l, img_r) = imgs_vec[img_idx];
+        std::tie(img_l, img_r) = laser_imgs_[img_idx];
         auto rectify_imgs_have_laser = getEpipolarRectifyImage(
             img_l,
             img_r
@@ -46,7 +32,7 @@ int main() {
         cv::Mat label_img_l, label_img_r;
         cv::Mat color_label_img_l, color_label_img_r;
         Two_PassNew(rectify_imgs_have_laser[0], label_img_l);
-        Two_PassNew(rectify_imgs_have_laser[1], label_img_r); 	
+        Two_PassNew(rectify_imgs_have_laser[1], label_img_r);
 	    LabelColor(label_img_l, color_label_img_l);
         LabelColor(label_img_r, color_label_img_r);
         cv::imwrite(debug_img_dir / ("labelImg_l" + std::to_string(img_idx) + ".jpg"), color_label_img_l);
@@ -89,9 +75,9 @@ int main() {
         cv::cvtColor(laser_img_l, laser_img_l, cv::COLOR_GRAY2BGR);
         cv::cvtColor(laser_img_r, laser_img_r, cv::COLOR_GRAY2BGR);
         for (const auto& l : laser_l)
-            for (const auto& [y, p] : l.points) cv::circle(laser_img_l, cv::Point2f(p.x, y), 1, cv::Scalar(255, 0, 255), -1);
+            for (const auto& [y, p] : l.points) laser_img_l.at<cv::Vec3b>(y, std::round(p.x)) = cv::Vec3b(255, 0, 255);
         for (const auto& l : laser_r)
-            for (const auto& [y, p] : l.points) cv::circle(laser_img_r, cv::Point2f(p.x, y), 1, cv::Scalar(255, 0, 255), -1);
+            for (const auto& [y, p] : l.points) laser_img_r.at<cv::Vec3b>(y, std::round(p.x)) = cv::Vec3b(255, 0, 255);
         cv::imwrite(debug_img_dir / ("laser_img_l" + std::to_string(img_idx) + ".jpg"), laser_img_l);
         cv::imwrite(debug_img_dir / ("laser_img_r" + std::to_string(img_idx) + ".jpg"), laser_img_r);
 
@@ -133,12 +119,12 @@ int main() {
         }
 
         // 重投影到右图（l_idx, plane_idx, r_idx）
-        auto match_vec_tuple = laser_processor.match3(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
 
         // 同名点匹配
         auto cloud_points = laser_processor.generateCloudPoints(match_vec_tuple, laser_l, laser_r);
 
-        std::string txt_file = std::to_string(2 + img_idx);
+        std::string txt_file = std::to_string(1 + img_idx);
         std::ofstream ofs(txt_file + ".txt");
         for (const auto& pt : cloud_points) {
             ofs << pt.x << " " << pt.y << " " << pt.z << "\n";

@@ -65,7 +65,8 @@ struct PlaneMatchResult {
     int plane_idx = -1; // 平面索引
     int point_count = 0; // 有效点数量（重投影在图像内的点数）
     int best_r_idx = -1; // 最佳匹配的右激光线索引
-    float avg_score = -FLT_MAX; // 最佳匹配的平均得分
+    float avg_score = -FLT_MAX; // 平均距离得分
+    float composite_score = -FLT_MAX;  // 平均得分 与 覆盖率惩罚得分 组合
     std::vector<ReprojectionInfo> reprojected_points; // 所有重投影点信息
     std::map<int, ScoreAccumulator> r_line_scores; // 右激光线索引 -> 分数累计
 };
@@ -91,45 +92,38 @@ public:
     float interpolateChannel(const cv::Mat& img, float x, float y);
     std::tuple<cv::Mat, cv::Mat, int> computeGaussianDerivatives(float sigma, float angle_rad, bool h_is_long_edge);
     float findSymmetricCenter(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range);
+    float findSymmetricCenter2(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range, size_t is_right);
+    float findSymmetricCenter3(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range);
     int convert_to_odd_number(float num);
 
     std::vector<cv::Point2f> processCenters(const std::map<float, float>& orign_centers);
     std::pair<cv::Point2f, cv::Point2f> getAxisEndpoints(const cv::RotatedRect& rect);
     std::vector<LaserLine> extractLine(const std::vector<cv::RotatedRect>& rois, const cv::Mat& rectify_img);
-
-    void match(
-        const std::vector<std::map<float, float>>& sample_points,
-        const std::vector<LaserLine>& laser_r,
-        const cv::Mat& rectify_l, const cv::Mat& rectify_r);
     
 
     double evaluateQuadSurf(const cv::Mat &Coeff6x1, const cv::Point3f &p);
     double evaluateQuadSurf(const cv::Mat& Coeff6x1, const std::vector<cv::Point3f>& points);
     std::vector<cv::Point3f> findIntersection(const cv::Point3f &point, const cv::Point3f &normal,
                                           const cv::Mat &Coeff6x1);
-    void match2(
-        const std::vector<std::map<float, float>>& sample_points,
-        const std::vector<LaserLine>& laser_r,
-        const cv::Mat& rectify_l, const cv::Mat& rectify_r);
     
+    float computeCompScore(float avg_dist, float coverage);
     std::vector<std::tuple<int, int, int>> match3(
         const std::vector<std::map<float, float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l, const cv::Mat& rectify_r);
 
+
+    std::vector<std::tuple<int,int,int>> match4(
+        const std::vector<std::map<float,float>>& sample_points,
+        const std::vector<LaserLine>& laser_r,
+        const cv::Mat& rectify_l,
+        const cv::Mat& rectify_r);
+
+
     std::vector<cv::Point3f> generateCloudPoints(
         const std::vector<std::tuple<int, int, int>>& laser_match,
         const std::vector<LaserLine> laser_l,
         const std::vector<LaserLine> laser_r);
-
-
-
-
-
-
-    cv::Vec2f computePrincipalDirection(const std::vector<cv::Point2f>& pts);
-    float orientationScore(const cv::Vec2f& v1, const cv::Vec2f& v2);
-    float dtwScore(const std::vector<float>& seq1, const std::vector<float>& seq2);
 
     void LabelColor(const cv::Mat& labelImg, cv::Mat& colorLabelImg);
     void Two_PassNew(const cv::Mat &img, cv::Mat &labImg);

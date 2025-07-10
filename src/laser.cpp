@@ -1,6 +1,7 @@
 #include "laser.h"
 #include <fstream>
 // #define DEBUG_PLANE_MATCH
+// #define DEBUG_CENTER_FIND
 
 /************************************** Extract Centers **************************************/
 int LaserProcessor::convert_to_odd_number(float num) {
@@ -162,45 +163,689 @@ float LaserProcessor::findSymmetricCenter(const cv::Mat& img, float x, float y, 
     return final_center;
 }
 
-std::vector<cv::Point2f> LaserProcessor::processCenters(const std::map<float, float>& orign_centers) {
+float LaserProcessor::findSymmetricCenter2(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range, size_t is_right) {
+#ifdef DEBUG_CENTER_FIND
+    cv::namedWindow("Gray Profile Visualization", cv::WINDOW_NORMAL);
+#endif
+    // 1. 搜索区间
+    std::vector<std::pair<float, float>> profile; // (位置t, 灰度值val)
+
+    // 更细致的步长
+    float step = 0.1f;
+    
+    // 在法向量方向采样灰度剖面
+    for (float t = -search_range; t <= search_range; t += step) {
+        float px = x + t*dir[0];
+        float py = y + t*dir[1];
+        float val = interpolateChannel(img, px, py);
+        profile.emplace_back(t, val);
+    }
+    
+    // 2. 找到灰度峰值区域
+    float max_val = -FLT_MAX;
+    for (const auto& p : profile) {
+        max_val = std::max(max_val, p.second);
+    }
+    
+    // 提取接近峰值的所有点（考虑到灰度相同的情况）
+    const float tolerance = 0.01f; // 灰度值容差
+    std::vector<float> peak_positions;
+    
+    for (const auto& p : profile) {
+        if (std::fabs(p.second - max_val) <= tolerance) {
+            peak_positions.push_back(p.first);
+        }
+    }
+    
+    float res1 = FLT_MAX, res2 = FLT_MAX, res3 = FLT_MAX;
+    std::vector<float> fit_t, fit_val;
+    fit_t.resize(7), fit_val.resize(7);
+
+    // 3. 如果有多个灰度相同的点，找到峰值区域的中心
+    if (peak_positions.size() > 1) {
+        // 连续同值区域分组
+        std::vector<std::vector<float>> regions;
+        std::vector<float> current_region = {peak_positions[0]};
+        
+        for (size_t i = 1; i < peak_positions.size(); ++i) {
+            // 如果与前一个点连续（考虑采样步长），归为同一区域
+            if (std::fabs(peak_positions[i] - peak_positions[i-1]) <= 1.5f * step) {
+                current_region.push_back(peak_positions[i]);
+            } else {
+                regions.push_back(current_region);
+                current_region = {peak_positions[i]};
+            }
+        }
+        
+        if (!current_region.empty()) {
+            regions.push_back(current_region);
+        }
+        
+        // 选择最长的连续区域（可能是线条的中心平台）
+        auto longest_region = std::max_element(regions.begin(), regions.end(),
+            [](const std::vector<float>& a, const std::vector<float>& b) {
+                return a.size() < b.size();
+            });
+        
+        if (longest_region != regions.end()) {
+            // 返回该区域的中心位置
+            float sum = 0;
+            for (float pos : *longest_region) {
+                sum += pos;
+            }
+            res1 = sum / longest_region->size();
+            
+#ifdef DEBUG_CENTER_FIND
+            
+            fit_t[0] = res1;
+            fit_val[0] = 0.9f;
+#endif
+        }
+    }
+    
+    // 4. 如果没有明显的平台区域，使用所有峰值的中心
+    if (!peak_positions.empty()) {
+        float sum = 0;
+        for (float pos : peak_positions) {
+            sum += pos;
+        }
+        res2 = sum / peak_positions.size();
+
+#ifdef DEBUG_CENTER_FIND
+        fit_t[1] = res2;
+        fit_val[1] = 0.9f;
+#endif
+    }
+    
+    // 5. 抛物线拟合
+    auto max_it = std::max_element(profile.begin(), profile.end(),
+        [](const std::pair<float, float>& a, const std::pair<float, float>& b) {
+            return a.second < b.second;
+        });
+    
+    size_t max_idx = std::distance(profile.begin(), max_it);
+    
+    // 抛物线五点拟合 - 改进版
+    float a_coef, b_coef, c_coef;
+    if (profile.size() >= 5) {
+        cv::Mat A(5, 3, CV_32F);
+        cv::Mat b(5, 1, CV_32F);
+        
+        // 使用基于分布的采样点选择策略
+        std::vector<size_t> selected_indices;
+        
+        // 确保包含最大值点
+        selected_indices.push_back(max_idx);
+        
+        // 计算合适的最小间隔（基于profile的总跨度）
+        float total_range = profile.back().first - profile.front().first;
+        // 将最小间隔从1/10改为1/30，使采样更密集
+        float min_distance = total_range / 30.0f; // 最小间隔为总范围的三十分之一
+        
+        // 创建非对称间隔策略，使峰值附近采样更密集
+        std::vector<float> distance_factors = {0.5f, 0.75f, 1.5f, 2.5f}; // 不同距离因子
+        
+        // 向左右两侧各选择两个点，峰值附近间隔更小
+        for (int direction = -1; direction <= 1; direction += 2) {
+            float last_t = profile[max_idx].first;
+            int idx = max_idx;
+            
+            for (int count = 0; count < 2; count++) {
+                bool found = false;
+                // 根据离峰值的距离动态调整最小间隔
+                float current_min_distance = min_distance * distance_factors[count];
+                
+                while (true) {
+                    idx += direction;
+                    if (idx < 0 || idx >= profile.size()) break;
+                    
+                    if (std::abs(profile[idx].first - last_t) >= current_min_distance) {
+                        selected_indices.push_back(idx);
+                        last_t = profile[idx].first;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+            }
+        }
+        
+        // 如果没有选出足够的点，使用备选策略
+        if (selected_indices.size() < 5) {
+            selected_indices.clear();
+            
+            // 备选策略：均匀分布选择
+            for (int i = 0; i < 5; i++) {
+                size_t idx = static_cast<size_t>(i * (profile.size() - 1) / 4); // 均匀分布
+                selected_indices.push_back(idx);
+            }
+            
+            // 确保包含最大值点
+            bool has_max = false;
+            for (size_t idx : selected_indices) {
+                if (idx == max_idx) {
+                    has_max = true;
+                    break;
+                }
+            }
+            
+            if (!has_max) {
+                // 用中间点替换为max_idx
+                selected_indices[2] = max_idx;
+            }
+        }
+        
+        // 排序确保索引有序
+        std::sort(selected_indices.begin(), selected_indices.end());
+        
+        // 使用选择的点进行拟合
+        for (int i = 0; i < selected_indices.size(); i++) {
+            const auto& p = profile[selected_indices[i]];
+            A.at<float>(i, 0) = p.first * p.first; 
+            A.at<float>(i, 1) = p.first; 
+            A.at<float>(i, 2) = 1;
+            b.at<float>(i, 0) = p.second; 
+
+#ifdef DEBUG_CENTER_FIND
+            if (i + 2 < fit_t.size()) {
+                fit_t[i + 2] = p.first;
+                fit_val[i + 2] = p.second;
+            }
+#endif
+        }
+    
+        cv::Mat coeffs;
+        if (cv::solve(A, b, coeffs, cv::DECOMP_SVD)) {
+            a_coef = coeffs.at<float>(0); 
+            b_coef = coeffs.at<float>(1);
+            c_coef = coeffs.at<float>(2);
+
+            if (a_coef < 0) { // 仅当抛物线开口向下时才接受拟合结果 
+                res3 = -b_coef / (2 * a_coef);
+
+                // 计算拟合点两侧灰度值
+                float left_intensity = interpolateChannel(img, x + (res3 - 3)*dir[0], y + (res3 - 3)*dir[1]);
+                
+                float right_intensity = interpolateChannel(img, x + (res3 + search_range/2)*dir[0], y + (res3 + search_range/2)*dir[1]);
+                float intensity_change = std::fabs(left_intensity - right_intensity);
+                
+                // 验证梯度幅值是否达标
+                if (intensity_change < 0.1) {
+                    res3 = FLT_MAX; // 拒绝平缓区域
+                }
+            }
+        }
+    }
+
+    /** 三点拟合
+    if (max_idx > 0 && max_idx < profile.size() - 1) {
+        // 取三个点进行抛物线拟合
+        float t0 = profile[max_idx-1].first;
+        float t1 = profile[max_idx].first;
+        float t2 = profile[max_idx+1].first;
+        
+        float y0 = profile[max_idx-1].second;
+        float y1 = profile[max_idx].second;
+        float y2 = profile[max_idx+1].second;
+        
+        // 抛物线拟合公式: y = a*t^2 + b*t + c
+        float denom = (t0-t1)*(t0-t2)*(t1-t2);
+        if (std::fabs(denom) > 1e-6f) {
+            float a = ((t2*(y1-y0) + t1*(y0-y2) + t0*(y2-y1)) / denom);
+            float b = ((t2*t2*(y0-y1) + t1*t1*(y2-y0) + t0*t0*(y1-y2)) / denom);
+            
+            // 计算抛物线峰值位置: t = -b/(2a)
+            if (std::fabs(a) > 1e-6f) {
+                return -b/(2*a);
+            }
+        }
+    }
+    */
+    
+#ifdef DEBUG_CENTER_FIND
+    // 可视化灰度剖面和抛物线拟合（每隔一定步长进行一次，避免过多）
+    // if (is_right == 0 && x > 720 && x < 815 && y > 300 && y < 370) {
+        // 创建FreeType2对象并加载中文字体
+        cv::Ptr<cv::freetype::FreeType2> ft2 = cv::freetype::createFreeType2();
+        ft2->loadFontData("./simsun.ttc", 0);
+        
+        // 创建灰度剖面图，增大宽度以容纳图例
+        cv::Mat profile_img(400, 800, CV_8UC3, cv::Scalar(255, 255, 255));
+        
+        // 绘制坐标轴
+        cv::line(profile_img, cv::Point(50, 350), cv::Point(550, 350), cv::Scalar(0, 0, 0), 1);
+        cv::line(profile_img, cv::Point(50, 50), cv::Point(50, 350), cv::Scalar(0, 0, 0), 1);
+        
+        // 添加水平轴刻度和标签
+        int num_ticks = 5; // t轴上的刻度数量(每边)
+        for (int i = -num_ticks; i <= num_ticks; i++) {
+            float tick_t = i * search_range / num_ticks;
+            int tick_x = 50 + static_cast<int>((tick_t + search_range) / (2 * search_range) * 500);
+            
+            // 绘制刻度线
+            cv::line(profile_img, cv::Point(tick_x, 350), cv::Point(tick_x, 355), cv::Scalar(0, 0, 0), 1);
+            
+            // 添加刻度值
+            std::string tick_label = cv::format("%.1f", tick_t);
+            ft2->putText(profile_img, tick_label, cv::Point(tick_x - 10, 370), 14, 
+                        cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        }
+        
+        // 添加垂直轴刻度和标签
+        int v_num_ticks = 5; // intensity轴上的刻度数量
+        for (int i = 0; i <= v_num_ticks; i++) {
+            float tick_val = static_cast<float>(i) / v_num_ticks;
+            int tick_y = 350 - static_cast<int>(tick_val * 300);
+            
+            // 绘制刻度线
+            cv::line(profile_img, cv::Point(45, tick_y), cv::Point(50, tick_y), cv::Scalar(0, 0, 0), 1);
+            
+            // 添加刻度值
+            std::string tick_label = cv::format("%.1f", tick_val);
+            ft2->putText(profile_img, tick_label, cv::Point(25, tick_y + 5), 14, 
+                        cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        }
+        
+        // 添加坐标轴标签
+        ft2->putText(profile_img, "t", cv::Point(550, 365), 16, cv::Scalar(0, 0, 0), -1, cv::LINE_AA, true);
+        ft2->putText(profile_img, "intensity", cv::Point(30, 40), 16, cv::Scalar(0, 0, 0), -1, cv::LINE_AA, true);
+        
+        // 映射函数将灰度剖面值映射到图像坐标
+        auto mapToImg = [&](float t, float val) -> cv::Point {
+            int img_x = 50 + static_cast<int>((t + search_range) / (2 * search_range) * 500);
+            int img_y = 350 - static_cast<int>(val * 300);
+            return cv::Point(img_x, img_y);
+        };
+        
+        // 绘制灰度剖面点
+        for (size_t i = 0; i < profile.size(); ++i) {
+            cv::Point pt = mapToImg(profile[i].first, profile[i].second);
+            cv::circle(profile_img, pt, 2, cv::Scalar(0, 0, 255), -1);
+            
+            // 连接相邻点
+            if (i > 0) {
+                cv::Point prev_pt = mapToImg(profile[i-1].first, profile[i-1].second);
+                cv::line(profile_img, prev_pt, pt, cv::Scalar(0, 0, 255), 1);
+            }
+        }
+        
+        // 绘制抛物线拟合结果
+        for (float t = -search_range; t <= search_range; t += 0.1f) {
+            float val = a_coef * t * t + b_coef * t + c_coef;
+            if (val >= 0 && val <= 1) {
+                cv::Point pt = mapToImg(t, val);
+                cv::circle(profile_img, pt, 1, cv::Scalar(0, 255, 0), -1);
+            }
+        }
+        
+        // 标记拟合使用的点
+        for (size_t i = 2; i < fit_t.size(); ++i) {
+            cv::Point pt = mapToImg(fit_t[i], fit_val[i]);
+            cv::circle(profile_img, pt, 4, cv::Scalar(255, 0, 0), 2);
+        }
+        
+        // 标记计算的峰值位置
+        if (res1 != FLT_MAX) {
+            cv::Point pt_res1 = mapToImg(fit_t[0], fit_val[0]);
+            cv::circle(profile_img, pt_res1, 5, cv::Scalar(255, 255, 0), -1);  // 青色
+        }
+        if (res2 != FLT_MAX) {
+            cv::Point pt_res2 = mapToImg(fit_t[1], fit_val[1]);
+            cv::circle(profile_img, pt_res2, 5, cv::Scalar(30, 105, 210), -1);  // 巧克力色
+        }
+        if (res3 != FLT_MAX) {
+            cv::Point peak_pt = mapToImg(res3, a_coef * res3 * res3 + b_coef * res3 + c_coef);
+            cv::circle(profile_img, peak_pt, 5, cv::Scalar(0, 255, 255), -1);   // 黄色
+        }
+        
+        // 添加文字说明
+        ft2->putText(profile_img, "Profile at (" + std::to_string(x) + "," + std::to_string((int)y) + ")", 
+                    cv::Point(50, 30), 16, cv::Scalar(0, 0, 0), -1, cv::LINE_AA, true);
+        ft2->putText(profile_img, "a=" + std::to_string(a_coef) + ", b=" + std::to_string(b_coef) + ", c=" + std::to_string(c_coef)
+                    + ", res1=" + (res1 == FLT_MAX ? "no" : std::to_string(res1))
+                    + ", res2=" + (res2 == FLT_MAX ? "no" : std::to_string(res2)) + ", res3=t_peak", 
+                    cv::Point(50, 390), 16, cv::Scalar(0, 0, 0), -1, cv::LINE_AA, true);
+        
+        // 添加右侧图例
+        int legend_x = 590;
+        int legend_y = 80;
+        int legend_spacing = 40;
+        
+        // 图例标题
+        ft2->putText(profile_img, "图例说明", cv::Point(legend_x, legend_y), 20, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        legend_y += 30;
+        
+        // 原始灰度剖面
+        cv::circle(profile_img, cv::Point(legend_x, legend_y), 2, cv::Scalar(0, 0, 255), -1);
+        cv::line(profile_img, cv::Point(legend_x-10, legend_y), cv::Point(legend_x+10, legend_y), cv::Scalar(0, 0, 255), 1);
+        ft2->putText(profile_img, "灰度剖面采样点", cv::Point(legend_x+20, legend_y+5), 20, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        
+        // 抛物线拟合
+        legend_y += legend_spacing;
+        cv::circle(profile_img, cv::Point(legend_x, legend_y), 2, cv::Scalar(0, 255, 0), -1);
+        cv::line(profile_img, cv::Point(legend_x-10, legend_y), cv::Point(legend_x+10, legend_y), cv::Scalar(0, 255, 0), 1);
+        ft2->putText(profile_img, "抛物线拟合曲线", cv::Point(legend_x+20, legend_y+5), 20, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        
+        // 拟合使用的点
+        legend_y += legend_spacing;
+        cv::circle(profile_img, cv::Point(legend_x, legend_y), 4, cv::Scalar(255, 0, 0), 2);
+        ft2->putText(profile_img, "拟合使用的采样点", cv::Point(legend_x+20, legend_y+5), 20, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        
+        // 计算的峰值位置
+        legend_y += legend_spacing;
+        cv::circle(profile_img, cv::Point(legend_x, legend_y), 5, cv::Scalar(0, 255, 255), -1);
+        ft2->putText(profile_img, "计算的线中心位置", cv::Point(legend_x+20, legend_y+5), 20, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        
+        // 添加计算方法说明
+        legend_y += legend_spacing;
+        ft2->putText(profile_img, "中心点计算方法:", cv::Point(legend_x, legend_y), 20, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        legend_y += 25;
+        ft2->putText(profile_img, "1. y = at²+bt+c", cv::Point(legend_x+10, legend_y), 18, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        legend_y += 20;
+        ft2->putText(profile_img, "2. t_peak = -b/(2a)", cv::Point(legend_x+10, legend_y), 18, 
+                    cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        legend_y += 20;
+        if (res3 == FLT_MAX)
+            ft2->putText(profile_img, "3. t_peak = 无" , cv::Point(legend_x+10, legend_y), 20, 
+                        cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        else
+            ft2->putText(profile_img, "3. t_peak = " + cv::format("%.4f", res3), cv::Point(legend_x+10, legend_y), 18, 
+                        cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA, true);
+        
+        // 显示图像
+        const std::string profile_name = "./gray_profile/(" + std::to_string(x) + "_" + std::to_string(y) + ").png";
+        //cv::imwrite(profile_name, profile_img);
+        while(true){
+            cv::imshow("Gray Profile Visualization", profile_img);
+            if (cv::waitKey(0) == 27) break;
+        }
+    // }
+#endif
+
+    // 如果所有方法都失败，说明是极端边缘点
+    float final_res = FLT_MAX;
+    if (res1 != FLT_MAX) final_res = res1;
+    else if (res2 != FLT_MAX) final_res = res2;
+    else if (res3 != FLT_MAX) final_res = res3;
+    return final_res;
+}
+
+float LaserProcessor::findSymmetricCenter3(
+    const cv::Mat& img,
+    float x, float y,
+    cv::Vec2f dir,
+    float R)
+{
+    // 采样与拟合参数
+    const float step    = 0.05f;   // t 方向采样步长
+#ifdef DEBUG_CENTER_FIND
+    // 准备可视化窗口
+    cv::namedWindow("GrayProfile", cv::WINDOW_NORMAL);
+#endif
+
+    // 1. 全范围采样
+    std::vector<float> Ts, Vs;
+    for (float t = -0.5f; t <= R; t += step) {
+        Ts.push_back(t);
+        Vs.push_back(interpolateChannel(img, x + t*dir[0], y + t*dir[1]));
+    }
+    int N = (int)Ts.size();
+    if (N < 3) return FLT_MAX;
+
+    // 2. 找到第一个峰值
+    int peakIdx = -1;
+    bool isRising = false;
+    for (int i = 1; i < N; ++i) {
+        if (Vs[i] > Vs[i-1]) {
+            // 检测到上升趋势
+            isRising = true;
+        } else if (isRising && (Vs[i] - Vs[i-1] < -1e-3f)) {
+            // 上升后首次出现下降，找到第一个峰
+            peakIdx = i-1;
+            break;
+        }
+    }
+    // 处理特殊情况
+    if (peakIdx == -1) {
+        if (isRising) peakIdx = N-1;    // 全程上升无下降：最后一个点为峰
+        else peakIdx = 0;               // 全程下降：第一个点为峰
+    }
+    float t_peak = Ts[peakIdx];
+
+    // 确定第一个峰的下降沿边界（向右搜索）
+    int rightBound = peakIdx + 1;  // 初始化为峰顶位置
+    while (rightBound < N) {
+        // 检测灰度值上升：表示下降沿结束
+        float diff = Vs[rightBound] - Vs[rightBound-1];
+        if (diff > 1e-3f) break;
+        rightBound++;
+    }
+    rightBound -= 2;
+
+    // 3. 平台检测 → res1
+    float res1 = FLT_MAX;
+    {
+        float v0 = Vs[peakIdx];
+        int L = peakIdx, Rg = peakIdx;
+        while (L>0 && std::fabs(Vs[L-1]-v0)<1e-4f) --L;
+        while (Rg+1<rightBound && std::fabs(Vs[Rg+1]-v0)<1e-4f) ++Rg;
+        if (Rg - L + 1 > 8) {
+            res1 = 0.5f*(Ts[L] + Ts[Rg]);
+        }
+    }
+#ifndef DEBUG_CENTER_FIND
+    if (res1 != FLT_MAX) {
+        return res1;
+    }
+#endif
+
+    // 4. 抛物线拟合 → res2
+    float res2 = FLT_MAX;
+    {
+        // 确定左右两侧长度
+        int leftLen = peakIdx;        // 左侧点个数（不包括峰值）
+        int rightLen = rightBound - 1 - peakIdx; // 右侧点个数（不包括峰值）
+
+        // 判断哪边更短，并获取短边末端索引和灰度值
+        int shortEnd;
+        float targetGray;
+        int searchStart, searchEnd;
+        
+        if (leftLen < rightLen) {
+            // 左侧较短
+            shortEnd = 0;
+            targetGray = Vs[0];
+            searchStart = peakIdx + 1;
+            searchEnd = rightBound;
+        } else {
+            // 右侧较短
+            shortEnd = rightBound;
+            targetGray = Vs[rightBound];
+            searchStart = 0;
+            searchEnd = peakIdx - 1;
+        }
+
+        // 在长边寻找灰度最接近的点
+        int matchIdx = -1;
+        float minDiff = FLT_MAX;
+        for (int i = searchStart; i <= searchEnd; i++) {
+            float diff = std::fabs(Vs[i] - targetGray);
+            if (diff < minDiff) {
+                minDiff = diff;
+                matchIdx = i;
+            }
+        }
+
+        // 确定拟合点集范围
+        int startIdx, endIdx;
+        if (leftLen < rightLen) {
+            startIdx = shortEnd;    // 左侧末端 (0)
+            endIdx = matchIdx;      // 右侧匹配点
+        } else {
+            startIdx = matchIdx;    // 左侧匹配点
+            endIdx = shortEnd;      // 右侧末端 (N-1)
+        }
+        int numPoints = endIdx - startIdx + 1;
+
+        // 至少需要3个点才能拟合抛物线
+        if (matchIdx != -1 && numPoints >= 3) {
+            cv::Mat A(numPoints, 3, CV_32F), Y(numPoints, 1, CV_32F);
+            for (int i = 0; i < numPoints; ++i) {
+                int idx = startIdx + i;
+                float t = Ts[idx];
+                A.at<float>(i, 0) = t * t;
+                A.at<float>(i, 1) = t;
+                A.at<float>(i, 2) = 1.0f;
+                Y.at<float>(i, 0) = Vs[idx];
+            }
+
+            cv::Mat coeff;
+            if (cv::solve(A, Y, coeff, cv::DECOMP_SVD)) {
+                float a = coeff.at<float>(0, 0);
+                float b = coeff.at<float>(1, 0);
+                if (a < 0) {  // 确保是开口向下的抛物线
+                    float tp = -b / (2 * a);
+                    if (tp >= -R && tp <= R) {
+                        res2 = tp;
+                    }
+                }
+            }
+        }
+    }
+#ifndef DEBUG_CENTER_FIND
+    if (res2 != FLT_MAX) {
+        return res2;
+    }
+#endif
+
+    float right_bound = Ts[rightBound];
+    float res3 = t_peak;
+
+
+#ifdef DEBUG_CENTER_FIND
+    //
+    // —— 可视化部分 —— 
+    //
+    int W = 800, H = 500;
+    cv::Mat prof_img(H, W, CV_8UC3, cv::Scalar(255,255,255));
+    int x0 = 60, y0 = H - 60;
+    int x1 = W - 200, y1 = 60;
+    // 0) 目前的点
+    cv::putText(prof_img, cv::format("%s%.3f%s%.3f%s", "Profile at (", x, ",", y,")"), 
+                cv::Point(50, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,0,0}, 1);
+
+    // 1) 坐标轴
+    cv::line(prof_img, {x0, y0}, {x1, y0}, {0,0,0}, 1);
+    cv::line(prof_img, {x0, y0}, {x0, y1}, {0,0,0}, 1);
+
+    // 2) 刻度与标签
+    int n_xt = 5;
+    for (int i = 0; i <= n_xt; ++i) {
+        float t_tick = -R + 2*R * i / n_xt;
+        int xt = x0 + int((t_tick + R)/(2*R)*(x1 - x0));
+        cv::line(prof_img, {xt, y0-5}, {xt, y0+5}, {0,0,0},1);
+        cv::putText(prof_img, cv::format("%.2f", t_tick),
+                    {xt-20, y0+25}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {0,0,0},1);
+    }
+    int n_yt = 5;
+    for (int i = 0; i <= n_yt; ++i) {
+        float v_tick = float(i)/n_yt;
+        int yt = y0 - int(v_tick*(y0 - y1));
+        cv::line(prof_img, {x0-5, yt}, {x0+5, yt}, {0,0,0},1);
+        cv::putText(prof_img, cv::format("%.2f", v_tick),
+                    {x0-60, yt+5}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {0,0,0},1);
+    }
+
+    // 3) 全采样点 & 连线（灰）
+    for (int i = 0; i < N; ++i) {
+        int xx = x0 + int((Ts[i]+R)/(2*R)*(x1 - x0));
+        int yy = y0 - int(Vs[i]*(y0 - y1));
+        cv::circle(prof_img, {xx,yy}, 3, {180,180,180}, -1);
+        if (i>0) {
+            int xx0 = x0 + int((Ts[i-1]+R)/(2*R)*(x1 - x0));
+            int yy0 = y0 - int(Vs[i-1]*(y0 - y1));
+            cv::line(prof_img, {xx0,yy0}, {xx,yy}, {200,200,200},1);
+        }
+    }
+
+
+    // 4) 三条垂直标线 & 图例
+    struct Rst{ float t; cv::Scalar c; const char* lbl; };
+    std::vector<Rst> rst = {
+        {res1, {0,255,0}, "res1"},
+        {res2, {255,0,0}, "res2"},
+        {res3, {255,255,0}, "res3"},
+        {right_bound, {128, 0, 128}, "r_bound"}
+    };
+    int lx = W - 180, ly = 80, dy = 30;
+    for (auto &r : rst) {
+        if (r.t==FLT_MAX) continue;
+        int xx = x0 + int((r.t+R)/(2*R)*(x1 - x0));
+        cv::line(prof_img, {xx, y1}, {xx, y0}, r.c, 1);
+        cv::putText(prof_img,
+            cv::format("%s: %.3f", r.lbl, r.t),
+            {lx, ly}, cv::FONT_HERSHEY_SIMPLEX, 0.6, r.c, 2);
+        ly += dy;
+    }
+
+    cv::imshow("GrayProfile", prof_img);
+    cv::waitKey(0);
+#endif
+
+    return res3;
+}
+
+std::vector<cv::Point2f> LaserProcessor::processCenters(
+    const std::map<float, float>& orign_centers)
+{
     std::vector<cv::Point2f> new_centers;
     if (orign_centers.empty()) return new_centers;
 
-    static auto isInteger = [](float y) {
-        return std::abs(y - std::round(y)) < 1e-5;
+    auto isInteger = [](float y) {
+        return std::abs(y - std::round(y)) < 1e-5f;
     };
 
-    auto itA = orign_centers.begin();
-    // 先处理第一个点 A 是否整数 y
-    if (isInteger(itA->first)) {
-        new_centers.emplace_back(itA->second, itA->first);
+    // 1. 如果第一个点 y 是整数，先加入
+    auto it = orign_centers.begin();
+    if (isInteger(it->first)) {
+        new_centers.emplace_back(it->second, std::round(it->first));
     }
 
-    // 遍历相邻对 (A, B)
-    for (auto itB = std::next(orign_centers.begin()); itB != orign_centers.end(); ++itB, ++itA) {
-        float yA = itA->first, xA = itA->second;
-        float yB = itB->first, xB = itB->second;
-
-        // 确保 A 在前，B 在后
+    // 2. 枚举每对相邻点之间的所有整数 y
+    for (auto nit = std::next(orign_centers.begin()); nit != orign_centers.end(); ++nit, ++it) {
+        float yA = it->first, xA = it->second;
+        float yB = nit->first, xB = nit->second;
         if (yB <= yA) continue;
 
-        // 向上取整得到第一个可能的整数 y 值
-        float yI = std::ceil(yA);
-        // 检查这个整数是否在 (yA, yB] 区间内
-        if (yI > yA && yI <= yB) {
-            // 如果 yI 恰好等于 B.y 并且 B.y 本身就是整数，直接使用 B 点
-            if (isInteger(yB) && std::fabs(yI - yB) < 1e-6f) {
-                new_centers.emplace_back(xB, std::round(yB));
+        // 从 floor(yA)+1 到 floor(yB) 枚举所有整数
+        int yi_start = static_cast<int>(std::floor(yA)) + 1;
+        int yi_end   = static_cast<int>(std::floor(yB));
+        for (int yi = yi_start; yi <= yi_end; ++yi) {
+            // 如果 yi 恰好等于 yB 且 yB 本身就是整数，用原点
+            if (isInteger(yB) && std::abs(yi - yB) < 1e-6f) {
+                new_centers.emplace_back(xB, yi);
             } else {
-                // 否则进行线性插值
-                float t = (yI - yA) / (yB - yA);
+                // 否则按 t 插值
+                float t = (yi - yA) / (yB - yA);
                 float xI = xA + t * (xB - xA);
-                new_centers.emplace_back(xI, std::round(yI));
+                new_centers.emplace_back(xI, static_cast<float>(yi));
             }
         }
-        // 如果 yI > yB，则说明区间内无整数；此时若 B.y 本身是整数，也可以直接加入
-        else if (isInteger(yB)) {
-            new_centers.emplace_back(xB, std::round(yB));
+    }
+
+    // 3. 如果最后一个点 y 是整数且还没加入，就补上
+    auto last = std::prev(orign_centers.end());
+    if (isInteger(last->first)) {
+        // 防止重复加入：如果 new_centers 最后一条记录 y 已经等于 last->first，就跳过
+        if (new_centers.empty() || std::abs(new_centers.back().y - last->first) > 1e-5f) {
+            new_centers.emplace_back(last->second, std::round(last->first));
         }
     }
 
@@ -272,44 +917,6 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
         cv::Mat roi_bin = cv::Mat::zeros(bin.size(), bin.type());
         bin.copyTo(roi_bin, mask);
 
-        // cv::Mat label_img, color_img;
-        // Two_PassNew(roi_bin, label_img);
-        // LabelColor(label_img, color_img);
-        // cv::Mat copy_rectify_img = rectify_img.clone();
-        
-        // // 收集所有连通区域点集
-        // int max_size_idx = -1, region_max_size = 0;
-        // std::map<int, std::vector<cv::Point>> regionPoints;
-        // for (int y = 0; y < label_img.rows; ++y) {
-        //     const int* row = label_img.ptr<int>(y);
-        //     for (int x = 0; x < label_img.cols; ++x) {
-        //         int label = row[x];
-        //         if (label > 1) // 忽略背景(0)和未处理区域(1)
-        //             regionPoints[label].emplace_back(x, y);
-        //     }
-        // }
-        // for (const auto& [key, val] : regionPoints) {
-        //     if (val.size() > region_max_size) {
-        //         region_max_size = val.size();
-        //         max_size_idx = key;
-        //     }
-        // }
-
-        // // 覆盖原图
-        // cv::Mat copy_rectify_img_float;
-        // if (regionPoints.size() != 1) {
-        //     for (const auto& [key, val] : regionPoints) {
-        //         if (key == max_size_idx && key > 1) continue;
-        //         for (const auto& p : val) {
-        //             copy_rectify_img.at<uchar>(p.y, p.x) = 0;
-        //         }
-        //     }
-        //     copy_rectify_img.convertTo(copy_rectify_img_float, CV_32F, 1.0f / 255.0f);
-        // }
-        // else copy_rectify_img_float = rectify_img_float.clone();
-
-        
-
         // 5. 查找轮廓 
         std::vector<std::vector<cv::Point>> contours;
         cv::findContours(roi_bin, contours, cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
@@ -326,24 +933,29 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
             });
         std::vector<std::vector<cv::Point>> max_contour{*max_it};
         std::vector<cv::Point2f> edge_pixels;
+        std::map<int, int> edge_maxY_map; // <x, y> 用于存储边缘点的映射
         auto [p1, p2] = getAxisEndpoints(roi);
         cv::Point2f axis = p2 - p1;
         float axis_len = cv::norm(axis);
         cv::Point2f axis_dir = axis / axis_len;
-        float min_proj = 0.06f * axis_len;
-        float max_proj = 0.94f * axis_len;
+        float min_proj = 0.02f * axis_len;
+        float max_proj = 0.98f * axis_len;
         for (const auto& pt : max_contour[0]) {
             cv::Point2f pt_f(pt.x, pt.y);
             cv::Point2f vec = pt_f - p1;
             float proj = vec.dot(axis_dir);
             if (proj >= min_proj && proj <= max_proj) {
                 edge_pixels.push_back(pt);
+                if (edge_maxY_map.find(pt.x) == edge_maxY_map.end())
+                    edge_maxY_map[pt.x] = pt.y;
+                else if (pt.y > edge_maxY_map[pt.x])
+                    edge_maxY_map[pt.x] = pt.y;
             }
         }
         // 可视化方向边缘
         cv::Mat fix_contour_vis;
         cv::cvtColor(rectify_img, fix_contour_vis, cv::COLOR_GRAY2BGR);
-        for (const auto& p : edge_pixels) cv::circle(fix_contour_vis, p, 1, cv::Scalar(0, 0, 255), -1);
+        for (const auto& p : edge_pixels) fix_contour_vis.at<cv::Vec3b>(cv::Point(p.x, p.y)) = cv::Vec3b(0, 255, 0); // 绿色表示边缘点
 
         // 7. 垂直剖解激光线
         auto is_toin = [&](const cv::Point2f& pt) -> bool {
@@ -362,26 +974,43 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
         cv::Mat direct_vis;
         cv::cvtColor(rectify_img, direct_vis, cv::COLOR_GRAY2BGR);
         for (const auto& p : edge_pixels)
-            if (is_toin(p)) cv::circle(direct_vis, p, 1, cv::Scalar(255, 0, 0), -1);
-            else cv::circle(direct_vis, p, 1, cv::Scalar(0, 255, 0), -1);
+            if (is_toin(p)) direct_vis.at<cv::Vec3b>(cv::Point(p.x, p.y)) = cv::Vec3b(0, 0, 255); // 红色表示向内
+            else direct_vis.at<cv::Vec3b>(cv::Point(p.x, p.y)) = cv::Vec3b(255, 0, 0); // 蓝色表示向外
 
         cv::Mat laser_center_vis;
         cv::cvtColor(rectify_img, laser_center_vis, cv::COLOR_GRAY2BGR);
         std::map<float, float> orign_centers;
+        std::unordered_map<int ,bool> x_used;
         for (const auto& p : edge_pixels) {
-            if (!is_toin(p)) continue;
+            if (!is_toin(p) || x_used[p.x]) continue;
 
+            auto it = edge_maxY_map.find(p.x);
+            if (it == edge_maxY_map.end()) continue;
+            float search_range = it->second - p.y;
+            if (search_range < 3) continue;
+            else if (search_range <= 6) search_range += search_range * 0.85f;
+            else if (search_range < 10) search_range += search_range * 0.7f;
+            else if (search_range > 10) search_range += 5.0f;
             cv::Vec2f dir(0, 1);
-            float t_peak = findSymmetricCenter(rectify_img_float, p.x, p.y, dir, roi_w);
+            x_used[p.x] = true;
+
+            // if (i == 4 && p.x == 54)
+            //     puts("");
+
+            // float t_peak = FLT_MAX;
+            // if (p.x >= 1445 && p.x <= 1448)
+            //     t_peak = findSymmetricCenter3(rectify_img_float, p.x, p.y, dir, search_range);
+
+            float t_peak = findSymmetricCenter3(rectify_img_float, p.x, p.y, dir, search_range);
             // float t_peak = findSymmetricCenter2(rectify_img_float, p.x, p.y, dir, roi_w, 0);
-            if (t_peak == FLT_MAX) continue;    // 说明抛物线拟合失败，可能是search_range极端边缘点
+            if (t_peak == FLT_MAX || t_peak <= 0) continue;
             float center_x = p.x + t_peak*dir[0], center_y = p.y + t_peak * dir[1];
 
             orign_centers[center_y] = center_x;
 
             // 可视化激光线中心点
             cv::Point2f center(center_x, center_y);
-            cv::circle(laser_center_vis, center, 1, cv::Scalar(0, 255, 0), -1);
+            laser_center_vis.at<cv::Vec3b>(cv::Point(center.x, std::round(center.y))) = cv::Vec3b(0, 255, 0); // 绿色表示中心点
         }
 
 
@@ -390,7 +1019,7 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
         cv::Mat new_centers_vis;
         cv::cvtColor(rectify_img, new_centers_vis, cv::COLOR_GRAY2BGR);
         std::vector<cv::Point2f> new_centers = processCenters(orign_centers);
-        for (const auto& p : new_centers) cv::circle(new_centers_vis, p, 1, cv::Scalar(0, 255, 0), -1);
+        for (const auto& p : new_centers) new_centers_vis.at<cv::Vec3b>(cv::Point(std::round(p.x), p.y)) = cv::Vec3b(0, 255, 0); // 绿色表示中心点
 
         // 9. 存储结果
         const float laser_width = std::min(roi.size.width, roi.size.height) / roi_scale_;
@@ -417,200 +1046,7 @@ std::vector<LaserLine> LaserProcessor::extractLine(const std::vector<cv::Rotated
 /*********************************************************************************** */
 
 
-/************************************** Match Laser **************************************/
-void LaserProcessor::match(
-    const std::vector<std::map<float, float>>& sample_points,
-    const std::vector<LaserLine>& laser_r,
-    const cv::Mat& rectify_l, const cv::Mat& rectify_r) {
-
-    const auto calib_info = ConfigManager::getInstance().getCalibInfo();
-    const auto planes = ConfigManager::getInstance().getPlane();
-
-    const double fx_l = calib_info.P[0].at<double>(0, 0);
-    const double fy_l = calib_info.P[0].at<double>(1, 1);
-    const double cx_l = calib_info.P[0].at<double>(0, 2);
-    const double cy_l = calib_info.P[0].at<double>(1, 2);
-    const double fx_r = calib_info.P[1].at<double>(0, 0);
-    const double fy_r = calib_info.P[1].at<double>(1, 1);
-    const double cx_r = calib_info.P[1].at<double>(0, 2);
-    const double cy_r = calib_info.P[1].at<double>(1, 2);
-    const double baseline = -calib_info.P[1].at<double>(0, 3) / fx_r;
-
-    for (int l_laser_idx = 0; l_laser_idx < static_cast<int>(sample_points.size()); ++l_laser_idx) {
-        const auto& l_points = sample_points[l_laser_idx];
-
-#ifdef DEBUG_PLANE_MATCH
-        cv::Mat rectify_r_img = rectify_r.clone();
-        cv::cvtColor(rectify_r_img, rectify_r_img, cv::COLOR_GRAY2BGR);
-        cv::Mat vis_img;
-        cv::hconcat(rectify_l, rectify_r, vis_img);
-        if (vis_img.channels() == 1)
-            cv::cvtColor(vis_img, vis_img, cv::COLOR_GRAY2BGR);
-        const int cols = rectify_l.cols;
-        cv::circle(vis_img, cv::Point(cx_l, cy_l), 4, cv::Scalar(0, 0, 255), -1);
-        cv::circle(vis_img, cv::Point(cx_r + cols, cy_r), 4, cv::Scalar(0, 0, 255), -1);
-#endif
-
-        MatchMap match_map;
-        for (const auto& [y, x] : l_points) {
-#ifdef DEBUG_PLANE_MATCH
-            cv::circle(vis_img, cv::Point(x, y), 2, cv::Scalar(0, 255, 0), -1);
-#endif
-            cv::Point3f ray_dir((x - cx_l) / fx_l, (y - cy_l) / fy_l, 1.0f);
-            ray_dir *= 1.0f / cv::norm(ray_dir);
-
-            for (int plane_idx = 0; plane_idx < static_cast<int>(planes.size()); ++plane_idx) {
-                const auto& plane = planes[plane_idx];
-                if (!plane.isValid()) continue;
-
-                const cv::Vec3f& normal = plane.normal;
-                float d = plane.d;
-                float cos_theta = ray_dir.dot(normal);
-                if (std::abs(cos_theta) < 1e-6f) continue;
-
-                // t = ((P_s - P_c) · N_s) / (D_c · N_s)，nP_s + d = 0， P_c = 0
-                float t = -d / cos_theta;
-
-                cv::Point3f pt = ray_dir * t;
-
-                cv::Point3f pt_r(pt.x - baseline, pt.y, pt.z);
-                float x_r = fx_r * pt_r.x / pt_r.z + cx_r;
-                float y_r = fy_r * pt_r.y / pt_r.z + cy_r;
-
-                
-                if (x_r < 0 || x_r >= rectify_r.cols || y_r < 0 || y_r >= rectify_r.rows) continue;
-
-#ifdef DEBUG_PLANE_MATCH
-                cv::circle(vis_img, cv::Point(cvRound(x_r) + cols, cvRound(y_r)), 2, cv::Scalar(0, 0, 255), -1);
-                cv::circle(rectify_r_img, cv::Point(x_r, y_r), 1, cv::Scalar(0, 0, 255), -1);
-#endif
-
-                for (int r_laser_idx = 0; r_laser_idx < static_cast<int>(laser_r.size()); ++r_laser_idx) {
-                    const auto& r_line = laser_r[r_laser_idx].points;
-                    if (r_line.empty()) continue;
-
-                    auto it = r_line.lower_bound(y_r);
-                    float min_dist = FLT_MAX;
-
-                    for (int j = 0; j < 3; ++j) {
-                        auto check_it = it;
-                        if (j == 0 && it != r_line.begin()) check_it = std::prev(it);
-                        else if (j == 2 && it != r_line.end()) check_it = std::next(it);
-                        if (check_it == r_line.end()) continue;
-
-                        const auto& pt_check = check_it->second;
-                        float dist = std::hypot(pt_check.x - x_r, pt_check.y - y_r);
-                        min_dist = std::min(min_dist, dist);
-                    }
-                    if (min_dist == FLT_MAX) continue;
-
-                    MatchKey key{l_laser_idx, plane_idx, r_laser_idx};
-                    float score = 1 / (min_dist + 1.0f);
-                    match_map[key].score_sum += score*score;
-                    match_map[key].count += 1;
-
-                    // if (l_laser_idx == 6 && (r_laser_idx == 8 || r_laser_idx == 10))
-                    //     printf("point(%f, %f) - r_idx_%d - p_idx_%d - score: %f\n", x, y, r_laser_idx, plane_idx, score);
-                }
-            }
-
-        }
-
-        // 寻找最佳匹配
-        int best_r_idx = -1;
-        int best_plane_idx = -1;
-        float best_score = -1.0f;
-        const int n_samples = static_cast<int>(l_points.size());
-
-        for (const auto& [key, result] : match_map) {
-            if (key.l_laser_idx != l_laser_idx) continue;
-            if (result.count < n_samples / 10) continue;  // 最小覆盖阈值
-
-            // 计算左激光线上所有采样点的平均得分
-            float avg_score = sqrt(result.score_sum / n_samples);
-
-            if (avg_score > best_score) {
-                best_score = avg_score;
-                best_plane_idx = key.plane_idx;
-                best_r_idx = key.r_laser_idx;
-            }
-
-            if (l_laser_idx == 6 && (key.r_laser_idx == 8 || key.r_laser_idx == 10) && (key.plane_idx == 4 || key.plane_idx == 3))
-                printf("L%d - R%d - P%d - Score %f\n", l_laser_idx, key.r_laser_idx, key.plane_idx, avg_score);
-        }
-
-#ifdef DEBUG_PLANE_MATCH
-        // 1. 可视化所有候选匹配线
-        for (const auto& [key, result] : match_map) {
-            if (key.l_laser_idx != l_laser_idx) continue;
-            if (result.count < n_samples / 10) continue;
-
-            const auto& r_points = laser_r[key.r_laser_idx].points;
-            float unit_score = result.score_sum / std::max(1, static_cast<int>(r_points.size()));
-            float coverage = result.count / float(n_samples);
-            float combined = unit_score * coverage;
-
-            // 匹配线颜色：最佳匹配高亮，其他为淡绿色
-            cv::Scalar line_color = (key.r_laser_idx == best_r_idx) ? cv::Scalar(128, 0, 128) : cv::Scalar(0, 180, 0);
-
-            // 画点
-            for (const auto& [y, pt] : r_points) {
-                cv::circle(vis_img, cv::Point(cvRound(pt.x + cols), cvRound(y)), 2, line_color, -1);
-            }
-
-            // 计算中心点
-            if (!r_points.empty()) {
-                float sum_x = 0, sum_y = 0;
-                for (const auto& [y, pt] : r_points) {
-                    sum_x += pt.x + cols;
-                    sum_y += y;
-                }
-                int center_x = cvRound(sum_x / r_points.size());
-                int center_y = cvRound(sum_y / r_points.size());
-
-                // 标注r_laser_idx
-                cv::putText(vis_img, "R" + std::to_string(key.r_laser_idx),
-                    cv::Point(center_x, center_y),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.4, line_color, 2);
-            }
-        }
-
-        // 2. 可视化最佳匹配连线
-        if (best_r_idx >= 0 && best_r_idx < static_cast<int>(laser_r.size())) {
-            const auto& best_line = laser_r[best_r_idx].points;
-            if (!l_points.empty() && !best_line.empty()) {
-                auto it_l = l_points.begin();
-                std::advance(it_l, l_points.size() / 2);
-                auto it_r = best_line.begin();
-                std::advance(it_r, best_line.size() / 2);
-                cv::line(vis_img, 
-                    cv::Point(cvRound(it_l->second), cvRound(it_l->first)),
-                    cv::Point(cvRound(it_r->second.x + cols), cvRound(it_r->first)),
-                    cv::Scalar(0, 255, 255), 2);
-            }
-        }
-
-        // 3. 显示最佳匹配文本
-        std::string text = (best_r_idx >= 0) ?
-            "Best Match: L" + std::to_string(l_laser_idx) +
-            " - R" + std::to_string(best_r_idx) +
-            " (P " + std::to_string(best_plane_idx) + " / S " + std::to_string(best_score) + ")" :
-            "Best Match: None";
-
-        cv::putText(vis_img, text,
-            cv::Point((vis_img.cols - 500) / 2, 40),
-            cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 2);
-
-        cv::namedWindow("Sample Points Projection", cv::WINDOW_NORMAL);
-        cv::resizeWindow("Sample Points Projection", vis_img.cols, vis_img.rows);
-        cv::imshow("Sample Points Projection", vis_img);
-        if (cv::waitKey(0) == 27) break;  // ESC 跳出所有可视化
-#endif
-    }
-}
-
-
-
+/************************************** Quad Surface Operation **************************************/
 std::vector<cv::Point3f> LaserProcessor::findIntersection(const cv::Point3f &point, const cv::Point3f &normal,
                                           const cv::Mat &Coeff6x1)
 {
@@ -697,333 +1133,6 @@ double LaserProcessor::evaluateQuadSurf(const cv::Mat& Coeff6x1, const std::vect
   float rmse = std::sqrt(mean_square);
   return rmse;
 }
-
-
-void LaserProcessor::match2(
-    const std::vector<std::map<float, float>>& sample_points,
-    const std::vector<LaserLine>& laser_r,
-    const cv::Mat& rectify_l, const cv::Mat& rectify_r) {
-
-    const auto calib_info = ConfigManager::getInstance().getCalibInfo();
-    const auto planes = ConfigManager::getInstance().getQuadSurfaces();
-
-    const double fx_l = calib_info.P[0].at<double>(0, 0);
-    const double fy_l = calib_info.P[0].at<double>(1, 1);
-    const double cx_l = calib_info.P[0].at<double>(0, 2);
-    const double cy_l = calib_info.P[0].at<double>(1, 2);
-    const double fx_r = calib_info.P[1].at<double>(0, 0);
-    const double fy_r = calib_info.P[1].at<double>(1, 1);
-    const double cx_r = calib_info.P[1].at<double>(0, 2);
-    const double cy_r = calib_info.P[1].at<double>(1, 2);
-    const double baseline = -calib_info.P[1].at<double>(0, 3) / fx_r;
-    
-    for (int l_laser_idx = 0; l_laser_idx < static_cast<int>(sample_points.size()); ++l_laser_idx) {
-        const auto& l_points = sample_points[l_laser_idx];
-        
-        // 为当前左激光线创建输出文件
-        std::ofstream data_ofs("points_3d/L" + std::to_string(l_laser_idx) + "_results.txt");
-        data_ofs << "左激光线 " << l_laser_idx << " 重投影与匹配结果\n";
-        data_ofs << "平面索引 | 最佳右激光线 | 平均得分 | 覆盖点数 | 总点数 | 点坐标 (左) | 重投影坐标 (右)\n";
-        
-#ifdef DEBUG_PLANE_MATCH
-        cv::Mat vis_img;
-        cv::hconcat(rectify_l, rectify_r, vis_img);
-        if (vis_img.channels() == 1)
-            cv::cvtColor(vis_img, vis_img, cv::COLOR_GRAY2BGR);
-        const int cols = rectify_l.cols;
-        cv::circle(vis_img, cv::Point(cx_l, cy_l), 4, cv::Scalar(0, 0, 255), -1);
-        cv::circle(vis_img, cv::Point(cx_r + cols, cy_r), 4, cv::Scalar(0, 0, 255), -1);
-#endif
-
-
-        MatchMap match_map;
-        std::map<int, PlaneMatchResult> plane_results;
-        
-        // 光平面循环：针对当前左激光线，遍历每个光平面
-        for (int plane_idx = 0; plane_idx < static_cast<int>(planes.size()); ++plane_idx) {
-            const auto& plane = planes[plane_idx];
-            PlaneMatchResult& result = plane_results[plane_idx];
-            result.plane_idx = plane_idx;
-            
-            // 为当前平面输出分数
-            std::string score_filename = "points_3d/L" + 
-                            std::to_string(l_laser_idx) + "_P" +
-                            std::to_string(plane_idx) + "_scores.txt";
-            std::ofstream score_ofs(score_filename);
-
-            // 点集循环：针对当前平面，遍历左激光线上的每个点
-            std::vector<cv::Point2f> vec_points;
-            for (const auto& [y, x] : l_points) {
-#ifdef DEBUG_PLANE_MATCH
-                cv::circle(vis_img, cv::Point(x, y), 2, cv::Scalar(0, 255, 0), -1);
-#endif
-                // 创建重投影信息（先初始化）
-                ReprojectionInfo info(x, y, -1, -1);
-                
-                cv::Point3f ray_dir((x - cx_l) / fx_l, (y - cy_l) / fy_l, 1.0f);
-                ray_dir *= 1.0f / cv::norm(ray_dir);
-                cv::Point3f ray_origin(0, 0, 0);
-
-                cv::Point3f pt;
-                if (plane.coefficients.rows == 4) { // 平面求交
-                    cv::Vec3f normal(
-                        plane.coefficients.at<float>(0, 0),
-                        plane.coefficients.at<float>(1, 0),
-                        plane.coefficients.at<float>(2, 0)
-                    );
-                    float d = plane.coefficients.at<float>(3, 0);
-                    float cos_theta = ray_dir.dot(normal);
-                    if (std::abs(cos_theta) < 1e-6f) {
-                        result.reprojected_points.push_back(info);
-                        continue; // 跳过无法求交的点
-                    }
-                    float t = -d / cos_theta;
-                    pt = ray_dir * t;
-                }
-                else {  // 曲面求交
-                    auto intersections = findIntersection(ray_origin, ray_dir, plane.coefficients);
-                    if (intersections.empty()) {
-                        result.reprojected_points.push_back(info);
-                        continue; // 跳过无交点的点
-                    }
-                    bool valid_pt_found = false;
-                    for (const auto& p : intersections) {
-                        float err = evaluateQuadSurf(plane.coefficients, p);
-                        if (p.z <= 100 || p.z >= 1200) continue;
-                        pt = p;
-                        valid_pt_found = true;
-                    }
-                    if (!valid_pt_found) {
-                        result.reprojected_points.push_back(info);
-                        continue; // 跳过无有效点的点
-                    }
-                }
-
-                // 只在左激光线的第一条平面输出3D点
-                // if (plane_idx == 0 && l_laser_idx == 0) {
-                //     std::ofstream ofs("points3d.txt", std::ios::app);
-                //     ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
-                //     ofs.close();
-                // }
-
-                cv::Point3f pt_r(pt.x - baseline, pt.y, pt.z);
-                float x_r = fx_r * pt_r.x / pt_r.z + cx_r;
-                float y_r = std::round(fy_r * pt_r.y / pt_r.z + cy_r);
-
-                // 更新重投影信息
-                info.x_right = x_r;
-                info.y_right = y_r;
-
-                // 如果点不在右图像内
-                if (x_r < 0 || x_r >= rectify_r.cols || y_r < 0 || y_r >= rectify_r.rows) {
-                    continue;
-                }
-
-#ifdef DEBUG_PLANE_MATCH
-                cv::circle(vis_img, cv::Point(cvRound(x_r) + cols, cvRound(y_r)), 1, cv::Scalar(0, 0, 255), -1);
-#endif
-
-
-                // 右激光线循环：针对当前点和平面结果，遍历所有右激光线
-                bool has_candidates = false;
-                for (int r_laser_idx = 0; r_laser_idx < static_cast<int>(laser_r.size()); ++r_laser_idx) {
-                    const auto& r_line = laser_r[r_laser_idx].points;
-                    if (r_line.empty()) continue;
-
-                    if (l_laser_idx == 1 && plane_idx == 1 && r_laser_idx == 2)
-                        puts("");
-
-                    float min_dist = FLT_MAX;
-                    auto it = r_line.find(y_r);
-                    if (it != r_line.end()) min_dist = std::hypot(it->second.x - x_r, it->second.y - y_r);
-                    if (min_dist == FLT_MAX) continue;
-
-                    // 记录该点在该右激光线上的得分
-                    has_candidates = true;
-                    info.r_scores[r_laser_idx] = min_dist;
-                    
-                    // 更新匹配映射
-                    MatchKey key{l_laser_idx, plane_idx, r_laser_idx};
-                    match_map[key].score_sum -= min_dist;
-                    match_map[key].count += 1;
-                    
-                    // 更新该右激光线的统计信息
-                    result.r_line_scores[r_laser_idx].score_sum -= min_dist;
-                    result.r_line_scores[r_laser_idx].count += 1;
-                    
-                    // 调试输出（根据需要启用）
-                    // if (l_laser_idx == 6 && (r_laser_idx == 8 || r_laser_idx == 10))
-                    //     printf("point(%f, %f) - r_idx_%d - p_idx_%d - score: %f\n", x, y, r_laser_idx, plane_idx, min_dist);
-                }
-                if (!has_candidates) continue;
-                // 保存重投影信息
-                result.reprojected_points.push_back(info);
-                result.point_count++;  // 仅计数有效点
-            } // end 点集循环
-            
-            // 处理完当前平面所有点后，计算该平面的匹配结果
-            if (result.point_count > 0) {
-                // 寻找该平面的最佳右激光线
-                float best_score = -FLT_MAX;
-                int best_r_idx = -1;
-                
-                for (auto& [r_idx, score_acc] : result.r_line_scores) {
-                    if (score_acc.count > 0) {
-                        float avg_score = score_acc.score_sum / score_acc.count;
-                        
-                        // 找出最佳右激光线
-                        if (avg_score > best_score) {
-                            best_score = avg_score;
-                            best_r_idx = r_idx;
-                        }
-                    }
-                }
-                
-                // 更新平面结果
-                result.best_r_idx = best_r_idx;
-                result.avg_score = best_score;
-                
-                // 输出当前平面的匹配摘要到文件
-                data_ofs << plane_idx << " | " << result.best_r_idx << " | " 
-                         << result.avg_score << " | " << result.point_count << " | " 
-                         << l_points.size() << "\n";
-                
-                // 输出所有重投影点的详细信息
-                for (const auto& info : result.reprojected_points) {
-                    data_ofs << "    P: (" << info.x_left << ", " << info.y_left << ") -> (" 
-                             << info.x_right << ", " << info.y_right << ") | ";      
-                    if (!info.r_scores.empty()) {
-                        data_ofs << "R Scores: [";
-                        for (const auto& [r_idx, score] : info.r_scores) {
-                            data_ofs << r_idx << ":" << score << " ";
-                        }
-                        data_ofs << "] | Best R: " << result.best_r_idx;
-                        if (result.best_r_idx >= 0 && info.r_scores.count(result.best_r_idx)) {
-                            data_ofs << " (Score: " << info.r_scores.at(result.best_r_idx) << ")";
-                        }
-                    } else if (info.x_right >= 0 && info.y_right >= 0) {
-                        data_ofs << "坐标在右图像范围内但无匹配";
-                    } else {
-                        data_ofs << "重投影到右图像外";
-                    }
-                    data_ofs << "\n";
-
-
-                    float output_score = -1;  // 默认无效分数
-                    // 检查当前平面最佳右激光线的分数是否存在
-                    if (info.r_scores.count(best_r_idx)) {
-                        score_ofs << info.r_scores.at(best_r_idx) << "\n";  // 输出分数值
-                    }
-                }
-                score_ofs.close();  // 关闭分数文件
-                
-                // 输出当前平面的匹配摘要到控制台
-                printf("左激光线 %d | 平面 %d | 最佳右线: %d | 平均得分: %.3f | 有效点: %d/%d\n",
-                       l_laser_idx, plane_idx, result.best_r_idx, result.avg_score, 
-                       result.point_count, static_cast<int>(l_points.size()));
-            }
-        } // end 光平面循环
-        
-        // 寻找最佳匹配
-        int best_r_idx = -1;
-        int best_plane_idx = -1;
-        float best_score = -FLT_MAX;
-        const int n_samples = static_cast<int>(l_points.size());
-
-        for (const auto& [key, result] : match_map) {
-            if (key.l_laser_idx != l_laser_idx) continue;
-            // if (result.count < n_samples / 10) continue;  // 最小覆盖阈值
-
-            // 计算左激光线上所有采样点的平均得分
-            float avg_score = result.score_sum / result.count;
-
-            if (avg_score > best_score) {
-                best_score = avg_score;
-                best_plane_idx = key.plane_idx;
-                best_r_idx = key.r_laser_idx;
-            }
-        }
-
-        // 输出整体匹配结果
-        if (best_r_idx >= 0) {
-            printf("左激光线 %d 最佳匹配: 平面 %d | 右线 %d | 得分 %.3f\n", 
-                   l_laser_idx, best_plane_idx, best_r_idx, best_score);
-        } else {
-            printf("左激光线 %d 没有找到有效匹配\n", l_laser_idx);
-        }   
-
-#ifdef DEBUG_PLANE_MATCH
-        // 1. 可视化所有候选匹配线
-        for (const auto& [key, result] : match_map) {
-            if (key.l_laser_idx != l_laser_idx) continue;
-            if (result.count < n_samples / 10) continue;
-
-            const auto& r_points = laser_r[key.r_laser_idx].points;
-            float unit_score = result.score_sum / std::max(1, static_cast<int>(r_points.size()));
-            float coverage = result.count / float(n_samples);
-            float combined = unit_score * coverage;
-
-            // 匹配线颜色：最佳匹配高亮，其他为淡绿色
-            cv::Scalar line_color = (key.r_laser_idx == best_r_idx) ? cv::Scalar(128, 0, 128) : cv::Scalar(0, 180, 0);
-
-            // 画点
-            for (const auto& [y, pt] : r_points) {
-                cv::circle(vis_img, cv::Point(cvRound(pt.x + cols), cvRound(y)), 2, line_color, -1);
-            }
-
-            // 计算中心点
-            if (!r_points.empty()) {
-                float sum_x = 0, sum_y = 0;
-                for (const auto& [y, pt] : r_points) {
-                    sum_x += pt.x + cols;
-                    sum_y += y;
-                }
-                int center_x = cvRound(sum_x / r_points.size());
-                int center_y = cvRound(sum_y / r_points.size());
-
-                // 标注r_laser_idx
-                cv::putText(vis_img, "R" + std::to_string(key.r_laser_idx),
-                    cv::Point(center_x, center_y),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.4, line_color, 2);
-            }
-        }
-
-        // 2. 可视化最佳匹配连线
-        if (best_r_idx >= 0 && best_r_idx < static_cast<int>(laser_r.size())) {
-            const auto& best_line = laser_r[best_r_idx].points;
-            if (!l_points.empty() && !best_line.empty()) {
-                auto it_l = l_points.begin();
-                std::advance(it_l, l_points.size() / 2);
-                auto it_r = best_line.begin();
-                std::advance(it_r, best_line.size() / 2);
-                cv::line(vis_img, 
-                    cv::Point(cvRound(it_l->second), cvRound(it_l->first)),
-                    cv::Point(cvRound(it_r->second.x + cols), cvRound(it_r->first)),
-                    cv::Scalar(0, 255, 255), 2);
-            }
-        }
-
-        // 3. 显示最佳匹配文本
-        std::string text = (best_r_idx >= 0) ?
-            "Best Match: L" + std::to_string(l_laser_idx) +
-            " - R" + std::to_string(best_r_idx) +
-            " (P " + std::to_string(best_plane_idx) + " / S " + std::to_string(best_score) + ")" :
-            "Best Match: None";
-
-        cv::putText(vis_img, text,
-            cv::Point((vis_img.cols - 500) / 2, 40),
-            cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 2);
-
-        cv::namedWindow("Sample Points Projection", cv::WINDOW_NORMAL);
-        cv::resizeWindow("Sample Points Projection", vis_img.cols, vis_img.rows);
-        cv::imshow("Sample Points Projection", vis_img);
-        if (cv::waitKey(0) == 27) break;  // ESC 跳出所有可视化
-#endif
-    
-    }
-
-}
-
 
 /*************************************************************************************** */
 
@@ -1167,7 +1276,15 @@ cv::Scalar LaserProcessor::GetRandomColor()
 }
 
 
+/************************************** Match Three ***************************************/
 
+float LaserProcessor::computeCompScore(float avg_dist, float coverage) {
+    const float DIS_WEIGHT = 2.0f;
+    const float COVER_WEIGHT = 1.0f;
+
+    // 分数越低越好
+    return (avg_dist * DIS_WEIGHT) + ((1.0f - coverage) * COVER_WEIGHT * 10.0f);
+}
 
 std::vector<std::tuple<int, int, int>> LaserProcessor::match3(
     const std::vector<std::map<float, float>>& sample_points,
@@ -1355,12 +1472,13 @@ std::vector<std::tuple<int, int, int>> LaserProcessor::match3(
                 float best_score = FLT_MAX; // 注意：这里分数越小越好
                 float second_best = FLT_MAX;
                 int best_r_idx = -1;
-                
+
                 // 找出最佳和次佳匹配
                 for (auto& [r_idx, score_acc] : result.r_line_scores) {
                     if (score_acc.count == 0) continue;
                     
                     float avg_score = score_acc.score_sum / score_acc.count;
+
                     if (avg_score < best_score) {
                         second_best = best_score;
                         best_score = avg_score;
@@ -1446,12 +1564,12 @@ std::vector<std::tuple<int, int, int>> LaserProcessor::match3(
                 std::string lock_reason;
                 
                 // 条件1：距离<5且差距>10
-                if (cand.avg_score < 5.0f && gap > 10.0f) {
+                if (cand.avg_score < 7.65f && gap > 10.0f) {
                     should_lock = true;
                     lock_reason = "距离<5且差距>10";
                 }
                 // 条件2：唯一候选且距离<5
-                else if (current_unmatched.candidates.size() == 1 && cand.avg_score < 5.0f) {
+                else if (current_unmatched.candidates.size() == 1 && cand.avg_score < 7.65f) {
                     should_lock = true;
                     lock_reason = "唯一候选且距离<5";
                 }
@@ -1576,7 +1694,7 @@ std::vector<std::tuple<int, int, int>> LaserProcessor::match3(
         
         // 应用阈值
         if (found) {
-            if (best_score < 5.0f) { // 小于5才匹配
+            if (best_score < 7.65f) { // 小于5才匹配
                 // 记录匹配结果
                 match_results.emplace_back(info.l_laser_idx, best_plane, best_r);
 
@@ -1612,6 +1730,243 @@ std::vector<std::tuple<int, int, int>> LaserProcessor::match3(
 
 
 /*************************************************************************************** */
+
+
+
+
+/************************************** Match Four ***************************************/
+struct MatchCandidate {
+    int l_idx;
+    int plane_idx;
+    int r_idx;
+    float score;
+    float avg_dist;
+    float coverage;
+};
+
+float computeCompScore(float avgDist, float coverage, float wD = 0.8f, float wC = 0.2f) {
+    return wD * avgDist + wC * (1.0f - coverage);
+}
+
+std::vector<std::tuple<int,int,int>> LaserProcessor::match4(
+    const std::vector<std::map<float,float>>& sample_points,
+    const std::vector<LaserLine>& laser_r,
+    const cv::Mat& rectify_l,
+    const cv::Mat& rectify_r)
+{
+    const auto calib = ConfigManager::getInstance().getCalibInfo();
+    const auto planes = ConfigManager::getInstance().getQuadSurfaces();
+    double fx_l=calib.P[0].at<double>(0,0), fy_l=calib.P[0].at<double>(1,1);
+    double cx_l=calib.P[0].at<double>(0,2), cy_l=calib.P[0].at<double>(1,2);
+    double fx_r=calib.P[1].at<double>(0,0), fy_r=calib.P[1].at<double>(1,1);
+    double cx_r=calib.P[1].at<double>(0,2), cy_r=calib.P[1].at<double>(1,2);
+    double baseline=-calib.P[1].at<double>(0,3)/fx_r;
+
+    int L = sample_points.size();
+    std::vector<std::vector<MatchCandidate>> allCands(L);
+    std::set<int> used_r;
+    std::vector<bool> locked(L,false);
+    std::vector<std::tuple<int,int,int>> match_results;
+
+    // 收集候选
+    for(int l=0; l<L; ++l) {
+        const auto& pts = sample_points[l];
+        for(int p=0; p<(int)planes.size(); ++p) {
+            int inCnt=0;
+            std::map<int,int> hits;
+            std::map<int,std::pair<float,int>> acc;
+            auto& coef=planes[p].coefficients;
+            for(auto [y,x]:pts) {
+                cv::Point3f ray((x-cx_l)/fx_l, (y-cy_l)/fy_l,1.0f);
+                ray *= 1.0f/cv::norm(ray);
+                auto ips = findIntersection({0,0,0}, ray, coef);
+                if(ips.empty()) continue;
+                cv::Point3f pt3; bool ok=false;
+                for(auto& q:ips) if(q.z>100&&q.z<1200){ pt3=q; ok=true; break; }
+                if(!ok) continue;
+                cv::Point3f pr(pt3.x-baseline, pt3.y, pt3.z);
+                float xr = fx_r*pr.x/pr.z + cx_r;
+                int yr = cvRound(fy_r*pr.y/pr.z + cy_r);
+                if(xr<0||xr>=rectify_r.cols||yr<0||yr>=rectify_r.rows) continue;
+                ++inCnt;
+                for(int r=0; r<(int)laser_r.size(); ++r) {
+                    if(used_r.count(r)) continue;
+                    auto it=laser_r[r].points.find(yr);
+                    if(it==laser_r[r].points.end()) continue;
+                    float d = hypot(it->second.x - xr, it->second.y - yr);
+                    hits[r]++;
+                    acc[r].first += d;
+                    acc[r].second++;
+                }
+            }
+            if(!inCnt) continue;
+            for(auto& [r,c]:hits) {
+                auto pr = acc[r];
+                float avg = pr.first/pr.second;
+                float cov = float(c)/inCnt;
+                float comp = computeCompScore(avg, cov);
+                allCands[l].push_back({l,p,r,comp,avg,cov});
+            }
+        }
+    }
+
+    // 第一次统一可视化
+#ifdef DEBUG_PLANE_MATCH
+    cv::Mat vis_global;
+    cv::hconcat(rectify_l, rectify_r, vis_global);
+    if(vis_global.channels()==1) cv::cvtColor(vis_global, vis_global, cv::COLOR_GRAY2BGR);
+    int off = rectify_l.cols;
+    cv::namedWindow("vis_img", cv::WINDOW_NORMAL);
+    cv::resizeWindow("vis_img", vis_global.cols, vis_global.rows);
+#endif
+    
+    for(int l=0; l<L; ++l) {
+        if(allCands[l].empty()) continue;
+
+#ifdef DEBUG_PLANE_MATCH
+        cv::Mat vis = vis_global.clone();
+        // 左激光线点
+        for(auto [y,x]:sample_points[l])
+            cv::circle(vis, cv::Point2f(x,y), 1.5, cv::Scalar(0,255,0), -1);
+        // 左激光线ID
+        int l_middle = sample_points[l].size() / 2;
+        auto l_mid_it = sample_points[l].begin();
+        std::advance(l_mid_it, l_middle);
+        cv::putText(vis, "L"+std::to_string(l), cv::Point2f(l_mid_it->second,l_mid_it->first), cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0,255,0), 2);
+#endif
+        // 按 plane_idx 提取最佳候选
+        std::map<int, MatchCandidate> bestOfPlane;
+        for(auto& m: allCands[l]) {
+            auto& b = bestOfPlane[m.plane_idx];
+            if(b.score==0 || m.score < b.score) b = m;
+        }
+        // 全局最佳
+        MatchCandidate globalBest = bestOfPlane.begin()->second;
+        for(auto& kv: bestOfPlane)
+            if(kv.second.score < globalBest.score) globalBest = kv.second;
+
+#ifdef DEBUG_PLANE_MATCH
+        // 重投影点（红）
+        for(auto& kv: bestOfPlane) {
+            auto m = kv.second;
+            auto& coef = planes[m.plane_idx].coefficients;
+            for(auto [y,x]: sample_points[l]) {
+                cv::Point3f ray((x-cx_l)/fx_l, (y-cy_l)/fy_l,1.0f);
+                ray*=1.0f/cv::norm(ray);
+                auto ips = findIntersection({0,0,0}, ray, coef);
+                if(ips.empty()) continue;
+                cv::Point3f pt3; bool ok=false;
+                for(auto& q:ips) if(q.z>100&&q.z<1200){pt3=q; ok=true; break;} if(!ok) continue;
+                cv::Point3f pr(pt3.x-baseline, pt3.y, pt3.z);
+                float xr = fx_r*pr.x/pr.z+cx_r; int yr=cvRound(fy_r*pr.y/pr.z+cy_r);
+                if(xr<0||xr>=rectify_r.cols||yr<0||yr>=rectify_r.rows) continue;
+                cv::circle(vis, cv::Point2f(xr+off, yr), 1.5, cv::Scalar(0,0,255), -1);
+            }
+        }
+
+        // 绘制右激光线点和ID
+        for(auto& kv: bestOfPlane) {
+            auto m = kv.second;
+            bool isGlobal = (m.r_idx==globalBest.r_idx);
+            cv::Scalar col = used_r.count(m.r_idx)? cv::Scalar(0,255,255)
+                            : isGlobal? cv::Scalar(128,0,128)
+                            : cv::Scalar(0,180,0);
+            for(auto& [y,pt]: laser_r[m.r_idx].points)
+                cv::circle(vis, cv::Point2f(pt.x+off, y), 1.5, col, -1);
+            auto it = laser_r[m.r_idx].points.begin();
+            int r_middle = laser_r[m.r_idx].points.size() / 2;
+            std::advance(it, r_middle);
+            if(it==laser_r[m.r_idx].points.end()) it=std::prev(laser_r[m.r_idx].points.end());
+            cv::putText(vis, "R"+std::to_string(m.r_idx), cv::Point2f(it->second.x+off, it->first),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.5, col,2);
+        }
+
+        // 状态文本
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Round1: L%d->R%d (P %d / S %.2f)",
+                 globalBest.l_idx, globalBest.r_idx,
+                 globalBest.plane_idx, globalBest.score);
+        cv::putText(vis, buf, {10,60}, cv::FONT_HERSHEY_SIMPLEX, 1.3, cv::Scalar(0,255,255),2);
+        cv::imshow("vis_img", vis);
+        cv::waitKey(0);
+#endif
+    }
+
+    // 多轮严格锁定
+    bool prog=true;
+    while(prog) {
+        prog=false;
+        for(int l=0;l<L;++l) if(!locked[l]){
+            std::vector<MatchCandidate> av;
+            for(auto& m: allCands[l]) if(!used_r.count(m.r_idx)) av.push_back(m);
+            if(av.empty()) continue;
+            std::sort(av.begin(), av.end(), [](auto&a,auto&b){return a.score<b.score;});
+            float b0=av[0].score, b1=av.size()>1?av[1].score:FLT_MAX;
+            if(b0<=25.0f && (av.size()==1 || b1-b0>=10.0f)) {
+                locked[l]=true;
+                used_r.insert(av[0].r_idx);
+                match_results.emplace_back(l,av[0].plane_idx,av[0].r_idx);
+                prog=true;
+                printf("   [锁定匹配] 左%d 平面%d→右%d 平均距离:%.2f 与次优差距:%.2f 综合得分:%.2f 覆盖率:%.2f%%\n",
+                       l,av[0].plane_idx,av[0].r_idx,av[0].avg_dist,b1-b0,av[0].score,av[0].coverage*100.0f);
+            }
+        }
+    }
+
+#ifdef DEBUG_PLANE_MATCH    
+    // 全局可视化锁定结果
+    static const std::vector<cv::Scalar> palette30 = {
+        {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0}, {255, 0, 255}, {0, 255, 255},
+        {128, 0, 0}, {0, 128, 0}, {0, 0, 128}, {128, 128, 0}, {128, 0, 128}, {0, 128, 128},
+        {64, 0, 128}, {128, 64, 0}, {0, 128, 64}, {64, 128, 0}, {0, 64, 128}, {128, 0, 64},
+        {192, 192, 0}, {192, 0, 192}, {64, 255, 0}, {255, 64, 0}, {0, 64, 255}, {0, 255, 64},
+        {255, 0, 64}, {64, 0, 255}, {192, 0, 64}, {64, 192, 0}, {0, 192, 64}, {64, 0, 192}
+    };
+    // 标注左线ID
+    for (int l = 0; l < L; ++l) {
+        int mid = sample_points[l].size() / 2;
+        auto it = sample_points[l].begin();
+        std::advance(it, mid);
+        cv::putText(vis_global, "L" + std::to_string(l),
+                    cv::Point2f(it->second, it->first),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0,255,0), 2);
+    }
+    // 标注右线ID
+    for (int r = 0; r < (int)laser_r.size(); ++r) {
+        int mid = laser_r[r].points.size() / 2;
+        auto it = laser_r[r].points.begin();
+        std::advance(it, mid);
+        cv::putText(vis_global, "R" + std::to_string(r),
+                    cv::Point2f(it->second.x + off, it->first),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.3, cv::Scalar(0,255,255), 2);
+    }
+
+    // 仅为配对线条着色（不绘制连线）
+    for (int idx = 0; idx < match_results.size(); ++idx) {
+        auto [l, p, r] = match_results[idx];
+        cv::Scalar clr = palette30[idx % palette30.size()];
+        // 左线点着色
+        for (auto& [y, x] : sample_points[l]) {
+            cv::circle(vis_global, cv::Point(cvRound(x), y), 3, clr, -1);
+        }
+        // 右线点着色
+        for (auto& [y, pt] : laser_r[r].points) {
+            cv::circle(vis_global, cv::Point(cvRound(pt.x) + off, y), 3, clr, -1);
+        }
+    }
+    cv::putText(vis_global, "vis_img", {10,30}, cv::FONT_HERSHEY_SIMPLEX,1.3, cv::Scalar(255,0,255),2);
+    cv::imshow("vis_img", vis_global);
+    cv::waitKey(0);
+    cv::destroyWindow("vis_img");
+#endif
+
+    return match_results;
+}
+/*************************************************************************************** */
+
+
+
+
 
 
 
@@ -1673,220 +2028,3 @@ std::vector<cv::Point3f> LaserProcessor::generateCloudPoints(
 }
 
 /************************************************************************************* */
-
-
-
-
-
-/************************************** Match Four **************************************
-// 计算点集的主方向（2D PCA）
-cv::Vec2f LaserProcessor::computePrincipalDirection(const std::vector<cv::Point2f>& pts) {
-    cv::Mat data(pts.size(), 2, CV_32F);
-    for (size_t i = 0; i < pts.size(); ++i) {
-        data.at<float>(i, 0) = pts[i].x;
-        data.at<float>(i, 1) = pts[i].y;
-    }
-    cv::PCA pca(data, cv::Mat(), cv::PCA::DATA_AS_ROW);
-    auto dir = pca.eigenvectors.row(0);
-    return cv::Vec2f(dir[0], dir[1]);
-}
-
-// 将角度映射为 [0,1] 相似度：夹角越小，相似度越高
-float LaserProcessor::orientationScore(const cv::Vec2f& v1, const cv::Vec2f& v2) {
-    float dot = v1.dot(v2) / (cv::norm(v1) * cv::norm(v2) + 1e-6f);
-    dot = std::clamp(dot, -1.0f, 1.0f);
-    float angle = std::acos(dot); // [0, pi]
-    // 5° 阈值下映射： angle=0->1, angle=5°->0
-    float cutoff = CV_PI * 5.0f / 180.0f;
-    return std::max(0.0f, 1.0f - angle / cutoff);
-}
-
-// 简易 DTW 计算两序列 x(y) 形状相似度, 返回 [0,1]
-float LaserProcessor::dtwScore(const std::vector<float>& seq1, const std::vector<float>& seq2) {
-    int n = seq1.size(), m = seq2.size();
-    const float INF = 1e9;
-    std::vector<std::vector<float>> D(n+1, std::vector<float>(m+1, INF));
-    D[0][0] = 0;
-    for (int i = 1; i <= n; ++i) {
-        for (int j = 1; j <= m; ++j) {
-            float cost = std::abs(seq1[i-1] - seq2[j-1]);
-            D[i][j] = cost + std::min({D[i-1][j], D[i][j-1], D[i-1][j-1]});
-        }
-    }
-    float dist = D[n][m];
-    // 用指数衰减映射到 [0,1]
-    return std::exp(-dist / (float)(n+m+1));
-}
-
-
-void LaserProcessor::match3(
-    const std::vector<std::map<float, float>>& sample_points,
-    const std::vector<LaserLine>& laser_r,
-    const cv::Mat& rectify_l, const cv::Mat& rectify_r) {
-
-    // 基本参数
-    auto calib_info = ConfigManager::getInstance().getCalibInfo();
-    auto planes     = ConfigManager::getInstance().getQuadSurfaces();
-    double fx_l = calib_info.P[0].at<double>(0,0), fy_l = calib_info.P[0].at<double>(1,1);
-    double cx_l = calib_info.P[0].at<double>(0,2), cy_l = calib_info.P[0].at<double>(1,2);
-    double fx_r = calib_info.P[1].at<double>(0,0), fy_r = calib_info.P[1].at<double>(1,1);
-    double cx_r = calib_info.P[1].at<double>(0,2), cy_r = calib_info.P[1].at<double>(1,2);
-    double baseline = -calib_info.P[1].at<double>(0,3) / fx_r;
-    
-    for (int l_idx = 0; l_idx < (int)sample_points.size(); ++l_idx) {
-        const auto& l_map = sample_points[l_idx];
-        std::vector<cv::Point2f> l_pts;
-        for (auto& [y,x]: l_map) l_pts.emplace_back(x,y);
-        if (l_pts.empty()) continue;
-
-// 可视化
-#ifdef DEBUG_PLANE_MATCH
-        cv::Mat vis;
-        cv::hconcat(rectify_l, rectify_r, vis);
-        if (vis.channels()==1) cv::cvtColor(vis, vis, cv::COLOR_GRAY2BGR);
-        int offset = rectify_l.cols;
-        cv::circle(vis, {cvRound(cx_l),cvRound(cy_l)},4,{0,0,255},-1);
-        cv::circle(vis, {cvRound(cx_r)+offset,cvRound(cy_r)},4,{0,0,255},-1);
-#endif
-
-        // 左侧主方向
-        cv::Vec2f dir_l = computePrincipalDirection(l_pts);
-
-        struct Candidate {int plane, rline; float score;};
-        std::vector<Candidate> cands;
-
-        // 平面循环
-        for (int p_idx = 0; p_idx < (int)planes.size(); ++p_idx) {
-            std::vector<cv::Point2f> reproj;
-            const auto& plane = planes[p_idx];
-            // 重投影点
-            for (auto& [y,x]: l_map) {
-#ifdef DEBUG_PLANE_MATCH
-                cv::circle(vis, cv::Point(x, y), 2, cv::Scalar(0, 255, 0), -1);
-#endif
-                // 创建重投影信息（先初始化）
-                ReprojectionInfo info(x, y, -1, -1);
-                
-                cv::Point3f ray_dir((x - cx_l) / fx_l, (y - cy_l) / fy_l, 1.0f);
-                ray_dir *= 1.0f / cv::norm(ray_dir);
-                cv::Point3f ray_origin(0, 0, 0);
-
-                cv::Point3f pt;
-                if (plane.coefficients.rows == 4) { // 平面求交
-                    cv::Vec3f normal(
-                        plane.coefficients.at<float>(0, 0),
-                        plane.coefficients.at<float>(1, 0),
-                        plane.coefficients.at<float>(2, 0)
-                    );
-                    float d = plane.coefficients.at<float>(3, 0);
-                    float cos_theta = ray_dir.dot(normal);
-                    if (std::abs(cos_theta) < 1e-6f) {
-                        result.reprojected_points.push_back(info);
-                        continue; // 跳过无法求交的点
-                    }
-                    float t = -d / cos_theta;
-                    pt = ray_dir * t;
-                }
-                else {  // 曲面求交
-                    auto intersections = findIntersection(ray_origin, ray_dir, plane.coefficients);
-                    if (intersections.empty()) {
-                        result.reprojected_points.push_back(info);
-                        continue; // 跳过无交点的点
-                    }
-                    bool valid_pt_found = false;
-                    for (const auto& p : intersections) {
-                        float err = evaluateQuadSurf(plane.coefficients, p);
-                        if (p.z <= 100 || p.z >= 1200) continue;
-                        pt = p;
-                        valid_pt_found = true;
-                    }
-                    if (!valid_pt_found) {
-                        result.reprojected_points.push_back(info);
-                        continue; // 跳过无有效点的点
-                    }
-                }
-
-                // 只在左激光线的第一条平面输出3D点
-                // if (plane_idx == 0 && l_laser_idx == 0) {
-                //     std::ofstream ofs("points3d.txt", std::ios::app);
-                //     ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
-                //     ofs.close();
-                // }
-
-                cv::Point3f pt_r(pt.x - baseline, pt.y, pt.z);
-                float x_r = fx_r * pt_r.x / pt_r.z + cx_r;
-                float y_r = std::round(fy_r * pt_r.y / pt_r.z + cy_r);
-
-                // 更新重投影信息
-                info.x_right = x_r;
-                info.y_right = y_r;
-
-                // 如果点不在右图像内
-                if (x_r >= 0 && x_r < rectify_r.cols && y_r >= 0 && y_r < rectify_r.rows)
-                    reproj.emplace_back(x_r,y_r);
-#ifdef DEBUG_PLANE_MATCH
-                cv::circle(vis, {cvRound(x_r)+offset,cvRound(y_r)},1,{0,255,0},-1);
-#endif
-
-            }
-            if (reproj.empty()) continue;
-
-            // 方向评分
-            cv::Vec2f dir_p = computePrincipalDirection(reproj);
-            float ori_s = orientationScore(dir_p, dir_l);
-            
-            // 横坐标序列
-            std::vector<float> seq_p;
-            for (auto& pt: reproj) seq_p.push_back(pt.x);
-
-            // 对每条右线打分
-            for (int r_idx = 0; r_idx < (int)laser_r.size(); ++r_idx) {
-                const auto& line = laser_r[r_idx].points;
-                if (line.empty()) continue;
-                // 右侧点与序列
-                std::vector<float> seq_r;
-                for (auto& [y,pt]: line) seq_r.push_back(pt.x);
-                float dtw_s = dtwScore(seq_p, seq_r);
-
-                // 距离得分
-                float sumd=0;
-                for (auto& pt: reproj) {
-                    // 找y最接近
-                    auto it = std::min_element(line.begin(), line.end(), [&](auto&a,auto&b){
-                        return std::abs(a.first-pt.y)<std::abs(b.first-pt.y);
-                    });
-                    sumd += cv::norm(cv::Point2f(it->second.x,it->first)-pt);
-                }
-                float dist_s = std::exp(-sumd/reproj.size()/50);
-
-                // 综合
-                float alpha=0.5f;
-                float final_s = alpha*dist_s + (1-alpha)*(ori_s*0.5f + dtw_s*0.5f);
-                cands.push_back({p_idx,r_idx,final_s});
-
-#ifdef DEBUG_PLANE_MATCH
-                // 可视化不同候选颜色深浅
-                cv::Scalar col = (final_s>0.5?cv::Scalar(255,0,255):cv::Scalar(0,180,0));
-                for (auto& [y,pt]: line)
-                    cv::circle(vis, {cvRound(pt.x)+offset,cvRound(y)},1,col,1);
-#endif
-            }
-        }
-
-        // 选择最优
-        if (!cands.empty()) {
-            auto best = *std::max_element(cands.begin(),cands.end(),[](auto&a,auto&b){return a.score<b.score;});
-            printf("L%d -> Plane %d, R%d, Score=%.3f\n",l_idx,best.plane,best.rline,best.score);
-#ifdef DEBUG_PLANE_MATCH
-            cv::putText(vis, "Best: P"+std::to_string(best.plane)+" R"+std::to_string(best.rline),
-                {50,50},cv::FONT_HERSHEY_SIMPLEX,1,{0,255,255},2);
-            cv::imshow("Match2 Debug", vis);
-            cv::waitKey(1);
-#endif
-        }
-    }
-}
-
-
-
-/*************************************************************************************** */

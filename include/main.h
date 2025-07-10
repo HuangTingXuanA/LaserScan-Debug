@@ -11,7 +11,7 @@ using ImageVec = std::vector<std::tuple<cv::Mat, cv::Mat, cv::Mat, cv::Mat>>;
 
 std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
 fs::path calib_info_dir_ = fs::current_path() / "calib_info";
-fs::path laser_imgs_dir_ = fs::current_path() / "laser_0701_4";
+fs::path laser_imgs_dir_ = fs::current_path() / "laser_0702_2";
 fs::path output_dir_ = fs::current_path() / "cloud";
 fs::path debug_img_dir = fs::current_path() / "debug_img";
 
@@ -50,6 +50,74 @@ void loadImgs() {
         }
         laser_imgs_.emplace_back(img_l, img_r);
     }
+}
+
+void loadTrackImgs() {
+    laser_imgs_.clear();  // 清空原有数据
+
+    // 1. 获取所有子文件夹并排序
+    std::vector<fs::path> subdirs;
+    for (const auto& entry : fs::directory_iterator(laser_imgs_dir_)) {
+        if (entry.is_directory()) {
+            subdirs.push_back(entry.path());
+        }
+    }
+    
+    // 按子文件夹数字名称排序
+    std::sort(subdirs.begin(), subdirs.end(), [](const auto& a, const auto& b) {
+        try {
+            return std::stoi(a.filename()) < std::stoi(b.filename());
+        } catch (...) {
+            return a.filename() < b.filename(); // 非数字名称按字典序
+        }
+    });
+
+    // 2. 遍历每个子文件夹处理指定图片
+    for (const auto& subdir : subdirs) {
+        fs::path img1_path, img2_path;
+        bool found_img1 = false;
+        bool found_img2 = false;
+        
+        // 只扫描文件，不递归子目录
+        for (const auto& file : fs::directory_iterator(subdir)) {
+            if (!file.is_regular_file()) continue;
+            
+            std::string stem = file.path().stem().string();
+            if (stem == "image1") {
+                img1_path = file.path();
+                found_img1 = true;
+            } else if (stem == "image2") {
+                img2_path = file.path();
+                found_img2 = true;
+            }
+            
+            // 已找到两图则提前退出扫描
+            if (found_img1 && found_img2) break;
+        }
+        
+        // 3. 读取找到的图像对
+        if (found_img1 && found_img2) {
+            cv::Mat img_l = cv::imread(img1_path.string(), cv::IMREAD_GRAYSCALE);
+            cv::Mat img_r = cv::imread(img2_path.string(), cv::IMREAD_GRAYSCALE);
+            
+            if (!img_l.empty() && !img_r.empty()) {
+                laser_imgs_.emplace_back(img_l, img_r);
+                std::cout << "Loaded image pair from: " << subdir.filename() << std::endl;
+            } else {
+                std::cerr << "Warning: Failed to load images in " << subdir 
+                          << " (" << img1_path << " or " << img2_path << ")" << std::endl;
+            }
+        } else {
+            std::cerr << "Warning: Missing image1 or image2 in " << subdir << std::endl;
+        }
+    }
+    
+    // 4. 最终检查
+    if (laser_imgs_.empty()) {
+        throw std::logic_error("No valid image pairs found in any subdirectory");
+    }
+    std::cout << "Successfully loaded " << laser_imgs_.size() 
+              << " image pairs from " << subdirs.size() << " subdirectories\n";
 }
 
 bool loadPlaneCalibInfo() {
