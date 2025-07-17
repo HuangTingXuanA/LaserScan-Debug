@@ -84,6 +84,13 @@ struct UnmatchedInfo {
     std::vector<CandidateMatch> candidates;
 };
 
+struct Interval { int y_start, y_end; };
+struct IntervalMatch {
+    int l_idx, p_idx, r_idx;
+    std::vector<Interval> intervals;
+    float score;
+    float coverage;
+};
 
 class LaserProcessor {
 public:
@@ -91,6 +98,7 @@ public:
 
     float interpolateChannel(const cv::Mat& img, float x, float y);
     std::tuple<cv::Mat, cv::Mat, int> computeGaussianDerivatives(float sigma, float angle_rad, bool h_is_long_edge);
+    std::tuple<cv::Mat, cv::Mat, int> computeGaussianDerivatives(float sigma);
     float findSymmetricCenter(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range);
     float findSymmetricCenter2(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range, size_t is_right);
     float findSymmetricCenter3(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range);
@@ -106,24 +114,37 @@ public:
     std::vector<cv::Point3f> findIntersection(const cv::Point3f &point, const cv::Point3f &normal,
                                           const cv::Mat &Coeff6x1);
     
-    float computeCompScore(float avg_dist, float coverage);
+    float computeCompScore3(float avg_dist, float coverage);
     std::vector<std::tuple<int, int, int>> match3(
         const std::vector<std::map<float, float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l, const cv::Mat& rectify_r);
 
 
+    float computeCompScore4(float avgDist, float coverage, float wD = 0.6f, float wC = 0.4f);
     std::vector<std::tuple<int,int,int>> match4(
         const std::vector<std::map<float,float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l,
         const cv::Mat& rectify_r);
 
+    std::vector<IntervalMatch> match5(
+        const std::vector<std::map<float,float>>& sample_points,
+        const std::vector<LaserLine>& laser_r,
+        const cv::Mat& rectify_l,
+        const cv::Mat& rectify_r);
+    
+
 
     std::vector<cv::Point3f> generateCloudPoints(
         const std::vector<std::tuple<int, int, int>>& laser_match,
         const std::vector<LaserLine> laser_l,
         const std::vector<LaserLine> laser_r);
+    
+    std::vector<cv::Point3f> generateCloudPoints2(
+        const std::vector<IntervalMatch>& matches,
+        const std::vector<LaserLine>& laser_l,
+        const std::vector<LaserLine>& laser_r);
 
     void LabelColor(const cv::Mat& labelImg, cv::Mat& colorLabelImg);
     void Two_PassNew(const cv::Mat &img, cv::Mat &labImg);

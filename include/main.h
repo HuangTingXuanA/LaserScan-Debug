@@ -11,7 +11,7 @@ using ImageVec = std::vector<std::tuple<cv::Mat, cv::Mat, cv::Mat, cv::Mat>>;
 
 std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
 fs::path calib_info_dir_ = fs::current_path() / "calib_info";
-fs::path laser_imgs_dir_ = fs::current_path() / "laser_0702_2";
+fs::path laser_imgs_dir_ = fs::current_path() / "test_single_3";
 fs::path output_dir_ = fs::current_path() / "cloud";
 fs::path debug_img_dir = fs::current_path() / "debug_img";
 
@@ -333,6 +333,102 @@ cv::Mat processImg(const cv::Mat& img_origin, int is_right, bool have_laser) {
     cv::morphologyEx(processed_img, processed_img, cv::MORPH_OPEN, kernel);
 
     return processed_img;
+}
+
+void fastAnisotropicDiffusion(cv::Mat& img, int iter=1) {
+    const float kappa = 15.0f;
+    cv::Mat flow, delta;
+    
+    // 快速梯度计算
+    cv::Mat gx, gy;
+    cv::Scharr(img, gx, CV_32F, 1, 0, 1/16.0f);
+    cv::Scharr(img, gy, CV_32F, 0, 1, 1/16.0f);
+    
+    // 单次迭代优化
+    cv::magnitude(gx, gy, flow);
+    flow = 1.0f / (1.0f + (flow / kappa).mul(flow / kappa));
+    
+    cv::Laplacian(img, delta, CV_32F);
+    img -= 0.2f * flow.mul(delta); // 加速收敛
+}
+
+void fastBreakProtection(cv::Mat& img) {
+    // 快速端点检测 (3x3邻域分析)
+    cv::Mat mask = cv::Mat::zeros(img.size(), CV_8U);
+    const uchar* p;
+    for (int y = 1; y < img.rows-1; y++) {
+        p = img.ptr<uchar>(y);
+        for (int x = 1; x < img.cols-1; x++) {
+            if (p[x] > 128) { // 潜在激光点
+                int neighbors = 0;
+                // 8邻域计数
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        neighbors += (img.at<uchar>(y+dy, x+dx) > 128);
+                    }
+                }
+                // 端点特征：1-2个邻居
+                if (neighbors <= 2) {
+                    circle(mask, cv::Point(x, y), 2, cv::Scalar(255), -1);
+                }
+            }
+        }
+    }
+    img.setTo(0, mask);
+}
+
+cv::Mat processImg2(const cv::Mat& img_origin, int is_right, bool have_laser) {
+    // 1. 灰度转换
+    CV_Assert(img_origin.type() == CV_8UC1);
+    cv::Mat gray_img = img_origin.clone();
+
+    // 2. 数据类型转换
+    cv::Mat img_float;
+    gray_img.convertTo(img_float, CV_32F);
+
+    // 3. 方向性高斯模糊 (垂直方向)
+    cv::Mat blurred;
+    cv::Mat kernel_x = cv::getGaussianKernel(3, -1);
+    cv::filter2D(img_float, blurred, CV_32F, kernel_x.t());
+
+    // 4. 快速各向异性扩散 (单次迭代)
+    fastAnisotropicDiffusion(blurred);
+
+    // 5. 转换精度
+    cv::Mat processed_img;
+    blurred.convertTo(processed_img, CV_8UC1);
+
+    // 6. 轻量级断裂保护
+    fastBreakProtection(processed_img);
+
+    return processed_img;
+}
+
+cv::Mat processImg3(const cv::Mat& img_origin, int is_right, bool have_laser) {
+    cv::Mat img_float;
+    img_origin.convertTo(img_float, CV_32F, 1.0 / 255.0);
+
+    // 双边滤波保边缘
+    cv::Mat bilateral = img_float.clone();
+    // cv::bilateralFilter(img_float, bilateral, 7, 0.1, 5.0);
+    fastAnisotropicDiffusion(bilateral, 4);
+
+    // DoG增强细线，但防止负值
+    cv::Mat blur_small, blur_large, dog, dog_pos;
+    cv::GaussianBlur(img_float, blur_small, cv::Size(3,3), 0.5);
+    cv::GaussianBlur(img_float, blur_large, cv::Size(9,9), 2.0);
+    dog = blur_small - blur_large;
+    dog_pos = dog.clone();
+    dog_pos.setTo(0, dog < 0); // 去除负值部分
+
+    // 混合增强（不会压低粗线中心）
+    cv::Mat enhanced = 0.7 * bilateral + 0.3 * dog_pos;
+
+    // 转换为 8U
+    cv::Mat enhanced_8u;
+    enhanced.convertTo(enhanced_8u, CV_8UC1, 255.0);
+    return enhanced_8u;
 }
 
 std::array<cv::Mat, 2> getEpipolarRectifyImage(

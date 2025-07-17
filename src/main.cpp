@@ -7,8 +7,8 @@
 
 int main() {
 
-    loadImgs();
-    // loadTrackImgs();
+    // loadImgs();
+    loadTrackImgs();
 
     bool is_load = loadStereoCalibInfo();
     if (!is_load) throw std::logic_error("can't load stereo calib info");
@@ -18,7 +18,8 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        // if (img_idx != 19) continue;
+        if (img_idx != 1) continue;
+        printf("idx: %d\n", (int)img_idx);
         
         cv::Mat img_l, img_r;
         std::tie(img_l, img_r) = laser_imgs_[img_idx];
@@ -33,8 +34,8 @@ int main() {
         // 生成连通区域
         cv::Mat label_img_l, label_img_r;
         cv::Mat color_label_img_l, color_label_img_r;
-        Two_PassNew(rectify_imgs_have_laser[0], label_img_l);
-        Two_PassNew(rectify_imgs_have_laser[1], label_img_r);
+        Two_PassNew2(rectify_imgs_have_laser[0], label_img_l);
+        Two_PassNew2(rectify_imgs_have_laser[1], label_img_r);
 	    LabelColor(label_img_l, color_label_img_l);
         LabelColor(label_img_r, color_label_img_r);
         cv::imwrite(debug_img_dir / ("labelImg_l" + std::to_string(img_idx) + ".jpg"), color_label_img_l);
@@ -119,12 +120,15 @@ int main() {
         }
 
         // 重投影到右图（l_idx, plane_idx, r_idx）
-        auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        // auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
 
         // 同名点匹配
-        auto cloud_points = laser_processor.generateCloudPoints(match_vec_tuple, laser_l, laser_r);
+        // auto cloud_points = laser_processor.generateCloudPoints(match_vec_tuple, laser_l, laser_r);
 
-        std::string txt_file = std::to_string(1 + img_idx);
+        auto match_res = laser_processor.match5(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
+
+        std::string txt_file = std::to_string(img_idx);
         std::ofstream ofs(txt_file + ".txt");
         for (const auto& pt : cloud_points) {
             ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
