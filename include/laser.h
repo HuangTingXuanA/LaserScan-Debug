@@ -122,6 +122,9 @@ public:
 
 
     float computeCompScore4(float avgDist, float coverage, float wD = 0.6f, float wC = 0.4f);
+    
+    // 改进的得分计算函数，考虑距离方差和长度归一化
+    float computeEnhancedScore(const std::vector<std::pair<int, float>>& distance_pairs, int left_line_total_points);
     std::vector<std::tuple<int,int,int>> match4(
         const std::vector<std::map<float,float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
@@ -129,6 +132,12 @@ public:
         const cv::Mat& rectify_r);
 
     std::vector<IntervalMatch> match5(
+        const std::vector<std::map<float,float>>& sample_points,
+        const std::vector<LaserLine>& laser_r,
+        const cv::Mat& rectify_l,
+        const cv::Mat& rectify_r);
+    
+    std::vector<IntervalMatch> match6(
         const std::vector<std::map<float,float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l,

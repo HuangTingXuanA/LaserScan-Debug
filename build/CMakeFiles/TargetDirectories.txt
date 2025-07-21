@@ -1,3 +1,0 @@
-/home/htx/CursorItem/LaserMatch/build/CMakeFiles/LaserCalib.dir
-/home/htx/CursorItem/LaserMatch/build/CMakeFiles/edit_cache.dir
-/home/htx/CursorItem/LaserMatch/build/CMakeFiles/rebuild_cache.dir

@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        if (img_idx != 1) continue;
+        if (img_idx <= 100) continue;
         printf("idx: %d\n", (int)img_idx);
         
         cv::Mat img_l, img_r;
@@ -125,7 +125,7 @@ int main() {
         // 同名点匹配
         // auto cloud_points = laser_processor.generateCloudPoints(match_vec_tuple, laser_l, laser_r);
 
-        auto match_res = laser_processor.match5(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        auto match_res = laser_processor.match6(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
         auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
 
         std::string txt_file = std::to_string(img_idx);
