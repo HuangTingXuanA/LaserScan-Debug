@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        if (img_idx <= 100) continue;
+        // if (img_idx <= 6) continue;
         printf("idx: %d\n", (int)img_idx);
         
         cv::Mat img_l, img_r;
@@ -30,6 +30,7 @@ int main() {
         calib_info = ConfigManager::getInstance().getCalibInfo();
         rectify_imgs_have_laser[0] = processImg(rectify_imgs_have_laser[0], 0, true);
         rectify_imgs_have_laser[1] = processImg(rectify_imgs_have_laser[1], 1, true);
+
 
         // 生成连通区域
         cv::Mat label_img_l, label_img_r;
@@ -63,8 +64,8 @@ int main() {
             }
 
         }
-        cv::imwrite(debug_img_dir / ("roiImg_l" + std::to_string(img_idx) + ".jpg"), roi_img_l);
-        cv::imwrite(debug_img_dir / ("roiImg_r" + std::to_string(img_idx) + ".jpg"), roi_img_r);
+        // cv::imwrite(debug_img_dir / ("roiImg_l" + std::to_string(img_idx) + ".jpg"), roi_img_l);
+        // cv::imwrite(debug_img_dir / ("roiImg_r" + std::to_string(img_idx) + ".jpg"), roi_img_r);
 
 
         // 激光线中心点提取

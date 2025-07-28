@@ -84,12 +84,20 @@ struct UnmatchedInfo {
     std::vector<CandidateMatch> candidates;
 };
 
-struct Interval { int y_start, y_end; };
+struct Interval { float y_start, y_end; int count;};
 struct IntervalMatch {
     int l_idx, p_idx, r_idx;
     std::vector<Interval> intervals;
     float score;
     float coverage;
+};
+// 浮点安全区间比较
+struct IntervalCompare {
+    bool operator()(const Interval& a, const Interval& b) const {
+        if (a.y_start < b.y_start - 1e-4) return true;
+        if (a.y_start > b.y_start + 1e-4) return false;
+        return a.y_end < b.y_end - 1e-4;
+    }
 };
 
 class LaserProcessor {
@@ -122,21 +130,20 @@ public:
 
 
     float computeCompScore4(float avgDist, float coverage, float wD = 0.6f, float wC = 0.4f);
-    
-    // 改进的得分计算函数，考虑距离方差和长度归一化
-    float computeEnhancedScore(const std::vector<std::pair<int, float>>& distance_pairs, int left_line_total_points);
+    float computeEnhancedScore(const std::vector<std::pair<float, float>>& distance_pairs, int left_line_total_points);
+
     std::vector<std::tuple<int,int,int>> match4(
         const std::vector<std::map<float,float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l,
         const cv::Mat& rectify_r);
-
+    
     std::vector<IntervalMatch> match5(
         const std::vector<std::map<float,float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
         const cv::Mat& rectify_l,
         const cv::Mat& rectify_r);
-    
+
     std::vector<IntervalMatch> match6(
         const std::vector<std::map<float,float>>& sample_points,
         const std::vector<LaserLine>& laser_r,
@@ -144,6 +151,8 @@ public:
         const cv::Mat& rectify_r);
     
 
+    void mergeIntervals(std::vector<Interval>& intervals, float prec) const;
+    bool isPointLocked(float y, const std::vector<Interval>& intervals) const;
 
     std::vector<cv::Point3f> generateCloudPoints(
         const std::vector<std::tuple<int, int, int>>& laser_match,
@@ -160,9 +169,15 @@ public:
     cv::Scalar GetRandomColor();
 
 private:
-    float roi_scale_ = 1.05f;
+    const float roi_scale_ = 1.05f;
+    const float precision = 0.5f;
+    const float EPS = 0.01;
 
     static bool isInteger(float v) {
         return std::fabs(v - std::round(v)) < 1e-6f;
+    }
+
+    inline float alignToPrecision(float y) {
+        return std::round(y / precision) * precision;
     }
 };
