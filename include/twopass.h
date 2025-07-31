@@ -2,6 +2,8 @@
 #include <vector>
 #include <opencv2/ximgproc.hpp>
 
+#define DEBUG_PassNew
+
 cv::Scalar GetRandomColor()
 {
 	uchar r = 255 * (rand() / (1.0 + RAND_MAX));
@@ -334,6 +336,217 @@ void Two_PassNew2(const cv::Mat &img, cv::Mat &labImg)
 			*data_cur = labelSet[*data_cur];
 		data_cur++;
 	}
+}
+
+void Two_PassNew3(
+	cv::Mat &bin_img,
+	std::vector<std::vector<std::pair<cv::Point, cv::Point>>>& final_contours,
+	int img_idx)
+{
+    cv::Mat label, stats, centroids;
+    int n_label = cv::connectedComponentsWithStats(bin_img, label, stats, centroids);
+    
+	// 面积与长宽比过滤
+	for (int i = 1; i < n_label; ++i) {
+		int area = stats.at<int>(i, cv::CC_STAT_AREA);
+        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+        float aspect = static_cast<float>(std::max(w, h)) / std::min(w, h);
+        if (area > 200 && aspect > 1.3) {
+            bin_img.setTo(255, label == i);
+        } else {
+            bin_img.setTo(0, label == i);
+            label.setTo(0, label == i);
+        }
+    }
+
+	auto computeSmoothness = [](const std::map<int, int>& edge_map) -> float {
+		if (edge_map.size() < 2) return 0.0f; // 单点或无点视为完全平滑
+		
+		float total_diff = 0.0f;
+		int valid_pairs = 0;
+		int prev_x = edge_map.begin()->first;
+		int prev_y = edge_map.begin()->second;
+		
+		// 使用迭代器遍历，确保有序处理
+		for (auto it = std::next(edge_map.begin()); it != edge_map.end(); ++it) {
+			int curr_x = it->first;
+			int curr_y = it->second;
+			
+			// 只考虑连续x坐标的点（跳过x不连续的点）
+			if (curr_x == prev_x + 1) {
+				float dy = static_cast<float>(std::abs(curr_y - prev_y));
+				total_diff += dy;
+				valid_pairs++;
+			}
+			prev_x = curr_x;
+			prev_y = curr_y;
+		}
+		
+		if (valid_pairs == 0) return 0.0f; // 没有有效点对
+		
+		// 平滑度评分：平均y变化量
+		return total_diff / valid_pairs;
+	};
+
+	// 边缘过滤
+	for (int i = 1; i < n_label; ++i) {
+		if (cv::countNonZero(label == i) == 0) continue;
+		
+		cv::Mat mask = (label == i); // 只保留当前连通区域
+    	cv::Mat region;
+    	bin_img.copyTo(region, mask); // 提取该区域的二值图
+
+		// 提取上下边缘
+		std::map<int, int> edge_maxY_map;
+        std::map<int, int> edge_minY_map;
+		std::vector<std::vector<cv::Point>> contours;
+		cv::findContours(region, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+		for (const auto& pt : contours[0]) {
+			// 找Y最小值
+			if (edge_minY_map.find(pt.x) == edge_minY_map.end())
+				edge_minY_map[pt.x] = pt.y;
+			else if (pt.y < edge_minY_map[pt.x])
+				edge_minY_map[pt.x] = pt.y;
+
+			// 找Y最大值
+			if (edge_maxY_map.find(pt.x) == edge_maxY_map.end())
+				edge_maxY_map[pt.x] = pt.y;
+			else if (pt.y > edge_maxY_map[pt.x])
+				edge_maxY_map[pt.x] = pt.y;
+		}
+
+		// 边缘平滑度过滤
+		float top_smooth = computeSmoothness(edge_minY_map);
+		float bot_smooth = computeSmoothness(edge_maxY_map);
+		float std_thresh = 5.0f;
+		if (top_smooth > std_thresh || bot_smooth > std_thresh) {
+			label.setTo(0, label == i);
+			continue; // 滤除该区域
+		}
+		// printf("top_std: %.3f / bot_std: %.3f\n", top_smooth, bot_smooth);
+
+		std::vector<std::pair<cv::Point, cv::Point>> edge_pair;
+		std::unordered_map<int ,bool> x_used;
+		for (const auto& [x, y] : edge_minY_map) {
+			if (x_used[x]) continue;
+
+			auto it = edge_maxY_map.find(x);
+            if (it == edge_maxY_map.end()) continue;
+
+			float search_range = (it->second - y + 1);
+            if (search_range < 3 || search_range > 24) continue;
+			
+			edge_pair.push_back(std::make_pair(cv::Point(x, y), cv::Point(it->first, it->second)));
+		}
+		final_contours.push_back(edge_pair);
+	}
+
+	// 只保留激光区域二值化图像
+	bin_img.setTo(0); // 全部设为0
+	for (const auto& edge_pair : final_contours) {
+		for (const auto& p : edge_pair) {
+			int x = p.first.x;
+			int y_start = p.first.y - 1;
+			int y_end = p.second.y + 1;
+			// 边界检查
+			y_start = std::max(0, y_start);
+			y_end = std::min(bin_img.rows - 1, y_end);
+
+			for (int y = y_start; y <= y_end; ++y) {
+				bin_img.at<uchar>(y, x) = 255;
+			}
+		}
+	}
+
+#ifdef DEBUG_PassNew
+	// 可视化
+	static int vis_img_cnt = 0;
+	cv::Mat color_label, direct_vis;
+    cv::cvtColor(bin_img, direct_vis, cv::COLOR_GRAY2BGR);
+	LabelColor(label, color_label);
+#endif
+
+	// 再次按面积和长宽比过滤激光线
+	n_label = cv::connectedComponentsWithStats(bin_img, label, stats, centroids);
+	for (int i = 1; i < n_label; ++i) {
+		int area = stats.at<int>(i, cv::CC_STAT_AREA);
+        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
+        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+        float aspect = static_cast<float>(std::max(w, h)) / std::min(w, h);
+        if (area > 500 && aspect > 1.3) {
+            bin_img.setTo(255, label == i);
+        } else {
+            bin_img.setTo(0, label == i);
+            label.setTo(0, label == i);
+        }
+    }
+
+	// 重新提取轮廓
+	final_contours.clear();
+	for (int i = 1; i < n_label; ++i) {
+		if (cv::countNonZero(label == i) == 0) continue;
+		
+		cv::Mat mask = (label == i); // 只保留当前连通区域
+    	cv::Mat region;
+    	bin_img.copyTo(region, mask); // 提取该区域的二值图
+
+		// 提取上下边缘
+		std::map<int, int> edge_maxY_map;
+        std::map<int, int> edge_minY_map;
+		std::vector<std::vector<cv::Point>> contours;
+		cv::findContours(region, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+
+		for (const auto& pt : contours[0]) {
+			// 找Y最小值
+			if (edge_minY_map.find(pt.x) == edge_minY_map.end())
+				edge_minY_map[pt.x] = pt.y;
+			else if (pt.y < edge_minY_map[pt.x])
+				edge_minY_map[pt.x] = pt.y;
+
+			// 找Y最大值
+			if (edge_maxY_map.find(pt.x) == edge_maxY_map.end())
+				edge_maxY_map[pt.x] = pt.y;
+			else if (pt.y > edge_maxY_map[pt.x])
+				edge_maxY_map[pt.x] = pt.y;
+		}
+
+		std::vector<std::pair<cv::Point, cv::Point>> edge_pair;
+		std::unordered_map<int ,bool> x_used;
+		for (const auto& [x, y] : edge_minY_map) {
+			if (x_used[x]) continue;
+
+			auto it = edge_maxY_map.find(x);
+            if (it == edge_maxY_map.end()) continue;
+
+			float search_range = (it->second - y + 1);
+            if (search_range < 3 || search_range > 20) continue;
+			
+			edge_pair.push_back(std::make_pair(cv::Point(x, y), cv::Point(it->first, it->second)));
+		}
+
+		final_contours.push_back(edge_pair);
+	}
+
+#ifdef DEBUG_PassNew
+	// 可视化
+	for (const auto& edge_pair : final_contours) {
+		for (const auto& p : edge_pair) {
+			direct_vis.at<cv::Vec3b>(cv::Point(p.first.x, p.first.y)) = cv::Vec3b(0, 0, 255); // 红色表示上边沿
+			direct_vis.at<cv::Vec3b>(cv::Point(p.second.x, p.second.y)) = cv::Vec3b(255, 0, 0); // 蓝色表示下边沿
+		}
+	}
+    if (vis_img_cnt % 2 == 0) {
+		cv::imwrite(debug_img_dir / ("labelImg_l" + std::to_string(img_idx) + ".jpg"), color_label);
+		cv::imwrite(debug_img_dir / ("direct_l_" + std::to_string(img_idx) + ".jpg"), direct_vis);
+	}
+    else {
+		cv::imwrite(debug_img_dir / ("labelImg_r" + std::to_string(img_idx) + ".jpg"), color_label);
+		cv::imwrite(debug_img_dir / ("direct_r_" + std::to_string(img_idx) + ".jpg"), direct_vis);
+	}
+    vis_img_cnt++;
+#endif
+
 }
 
 std::vector<cv::RotatedRect> DetectLaserRegions(cv::Mat& labImg) {

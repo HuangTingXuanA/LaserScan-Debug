@@ -2,6 +2,15 @@
 #include "type.h"
 #include <shared_mutex>
 #include <unordered_map>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+inline std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
+inline fs::path calib_info_dir_ = fs::current_path() / "calib_info_0731";
+inline fs::path laser_imgs_dir_ = fs::current_path() / "laser_0731";
+inline fs::path output_dir_ = fs::current_path() / "cloud";
+inline fs::path debug_img_dir = fs::current_path() / "debug_img";
 
 class ConfigManager {
 public:

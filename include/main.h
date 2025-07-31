@@ -1,19 +1,8 @@
 #pragma once
 #include "configer.h"
 #include <atomic>
-#include <filesystem>
 #include <numeric>
 #include <regex>
-
-
-namespace fs = std::filesystem;
-using ImageVec = std::vector<std::tuple<cv::Mat, cv::Mat, cv::Mat, cv::Mat>>;
-
-std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
-fs::path calib_info_dir_ = fs::current_path() / "calib_info";
-fs::path laser_imgs_dir_ = fs::current_path() / "test_single_5";
-fs::path output_dir_ = fs::current_path() / "cloud";
-fs::path debug_img_dir = fs::current_path() / "debug_img";
 
 void loadImgs() {
     // 读取点云检测图片
@@ -334,6 +323,35 @@ cv::Mat processImg(const cv::Mat& img_origin, int is_right, bool have_laser) {
 
     return processed_img;
 }
+
+cv::Mat processImg2(const cv::Mat& img_origin, int is_right, bool have_laser) {
+    // 1. 灰度转换
+    cv::Mat gray_img;
+    if (img_origin.channels() != 1) {
+        cv::cvtColor(img_origin, gray_img, cv::COLOR_RGB2GRAY);
+    } else {
+        gray_img = img_origin.clone();
+    }
+
+    // 2. 中值滤波，去除反光和斑点噪声，保护边缘
+    cv::Mat denoised_img;
+    cv::medianBlur(gray_img, denoised_img, 5); // 5x5核，强力去除小噪声
+
+    // 3. 自适应阈值，增强激光线结构
+    cv::Mat binary_img;
+    cv::adaptiveThreshold(denoised_img, binary_img, 255,
+                         cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY,
+                         31, -17); // 21为窗口，10为偏置，可根据实际调整
+
+    // 4. 形态学开运算，去除小噪声，保护细线
+    int morph_size = std::min(binary_img.rows, binary_img.cols) > 2000 ? 3 : 1;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(morph_size, morph_size));
+    cv::morphologyEx(binary_img, binary_img, cv::MORPH_OPEN, kernel);
+
+    // 5. 返回处理结果
+    return binary_img;
+}
+
 
 std::array<cv::Mat, 2> getEpipolarRectifyImage(
     const cv::Mat& img_l, 
