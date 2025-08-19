@@ -1,6 +1,6 @@
 #include "laser.h"
 #include <fstream>
-#define DEBUG_PLANE_MATCH
+// #define DEBUG_PLANE_MATCH
 #define DEBUG_PLANE_MATCH_FINAL
 // #define DEBUG_CENTER_FIND
 
@@ -59,23 +59,134 @@ std::tuple<cv::Mat, cv::Mat, int> LaserProcessor::computeGaussianDerivatives(flo
     return {dx_kernel, dy_kernel ,ksize};
 }
 
-std::tuple<cv::Mat, cv::Mat, int> LaserProcessor::computeGaussianDerivatives(float sigma_val) 
-{
-    // 计算核尺寸（确保为奇数）
-    int ksize = cvRound(sigma_val * 3 * 2) + 1;
-    ksize = std::max(ksize, 3) > 31 ? 31 : std::max(ksize, 3);
-    ksize = ksize % 2 == 0 ? ksize + 1 : ksize;
+cv::Mat LaserProcessor::computeGaussianDerivatives(float sigma, float epsilon) {
+    // 确定核半径（文档2.3节）
+    float x0 = sigma * std::sqrt(-2 * std::log(epsilon/2));
+    int radius = std::ceil(x0);
+    int ksize = 2 * radius + 1;
     
-    // 创建标准高斯导数核（不旋转）
-    cv::Mat dx_kernel, dy_kernel;
-    cv::getDerivKernels(dx_kernel, dy_kernel, 1, 1, ksize, false, CV_32F);
+    cv::Mat kernel(ksize, 1, CV_32F);
+    float sum = 0.0f;
     
-    // 应用尺度缩放（符合高斯导数定义）
-    float scale_factor = -1.0f / (sigma_val * sigma_val);
-    cv::multiply(dx_kernel, scale_factor, dx_kernel);
-    cv::multiply(dy_kernel, scale_factor, dy_kernel);
+    // 高斯累积分布函数（文档公式9）
+    auto phi = [](float x, float sigma) {
+        return 0.5f * (1.0f + std::erf(x / (sigma * std::sqrt(2.0f))));
+    };
     
-    return {dx_kernel, dy_kernel, ksize};
+    // 构建离散积分核（文档公式18）
+    for (int i = 0; i < ksize; ++i) {
+        float x = i - radius;
+        float val = phi(x + 0.5f, sigma) - phi(x - 0.5f, sigma);
+        kernel.at<float>(i) = val;
+        sum += val;
+    }
+    
+    // 归一化处理（文档2.3节）
+    kernel /= sum;
+    return kernel;
+}
+
+cv::Mat LaserProcessor::getSafeROI(const cv::Mat& img, int x, int y, int size) {
+    int r = size/2;
+    int x0 = std::max(0, x - r);
+    int y0 = std::max(0, y - r);
+    int x1 = std::min(img.cols-1, x + r);
+    int y1 = std::min(img.rows-1, y + r);
+    
+    // 保证最小3x3区域
+    if (x1-x0 < 3) x0 = std::max(0,x-1), x1 = std::min(img.cols-1,x+1);
+    if (y1-y0 < 3) y0 = std::max(0,y-1), y1 = std::min(img.rows-1,y+1);
+    
+    return img(cv::Rect(x0, y0, x1-x0+1, y1-y0+1)).clone();
+}
+
+cv::Point2f LaserProcessor::computeStegerCenter(
+    const cv::Mat& img,
+    int x, int y,
+    float sigma
+) {
+    // 1. 生成积分高斯核（文档公式16-18）
+    float x0 = sigma * std::sqrt(-2 * std::log(1e-4f));
+    int radius = std::ceil(x0);
+    int ksize = 2 * radius + 1;
+    cv::Mat kernel(ksize, 1, CV_32F);
+    
+    // 高斯累积函数（文档公式9）
+    auto phi = [](float x, float s) {
+        return 0.5f * (1.0f + std::erf(x / (s * std::sqrt(2.0f))));
+    };
+    for (int i = 0; i < ksize; ++i) {
+        float pos = i - radius;
+        kernel.at<float>(i) = phi(pos + 0.5f, sigma) - phi(pos - 0.5f, sigma);
+    }
+    kernel /= cv::sum(kernel)[0];  // 归一化
+
+    // 2. 计算一阶导数核（文档公式4）
+    cv::Mat dx_kernel = cv::Mat::zeros(ksize, 1, CV_32F);
+    for (int i = 1; i < ksize - 1; ++i) {
+        dx_kernel.at<float>(i) = kernel.at<float>(i+1) - kernel.at<float>(i-1);
+    }
+
+    // 3. 计算二阶导数核（文档公式5）
+    cv::Mat dxx_kernel = cv::Mat::zeros(ksize, 1, CV_32F);
+    for (int i = 1; i < ksize - 1; ++i) {
+        dxx_kernel.at<float>(i) = dx_kernel.at<float>(i+1) - dx_kernel.at<float>(i-1);
+    }
+
+    // 4. 提取局部ROI（考虑边界安全）
+    cv::Rect roi(
+        std::max(0, x - radius),
+        std::max(0, y - radius),
+        std::min(ksize, img.cols - x + radius),
+        std::min(ksize, img.rows - y + radius)
+    );
+    if (roi.width < 3 || roi.height < 3) 
+        return cv::Point2f(-1, -1);
+    
+    cv::Mat patch = img(roi).clone();
+
+    // 5. 计算偏导数（文档§2.3）
+    cv::Mat I_x, I_y, I_xx, I_xy, I_yy;
+    cv::filter2D(patch, I_x, CV_32F, dx_kernel);      // x方向一阶导
+    cv::filter2D(patch, I_y, CV_32F, dx_kernel.t());  // y方向一阶导
+    cv::filter2D(I_x, I_xx, CV_32F, dxx_kernel);      // xx二阶导
+    cv::filter2D(I_x, I_xy, CV_32F, dx_kernel.t());    // xy混合导
+    cv::filter2D(I_y, I_yy, CV_32F, dxx_kernel.t());  // yy二阶导
+
+    // 6. 中心点Hessian矩阵（文档公式21）
+    int cx = patch.cols / 2, cy = patch.rows / 2;
+    float a = I_xx.at<float>(cy, cx);
+    float b = I_xy.at<float>(cy, cx);
+    float c = I_yy.at<float>(cy, cx);
+    cv::Matx22f H(a, b, b, c);
+    
+    // 7. 特征分解求法向量（文档§2.4）
+    cv::Vec2f eigenvalues;
+    cv::Matx22f eigenvectors;
+    if (!cv::eigen(H, eigenvalues, eigenvectors))
+        return cv::Point2f(-1, -1);
+    
+    // 选取最大特征值对应向量
+    int max_idx = (std::abs(eigenvalues[0]) > std::abs(eigenvalues[1])) ? 0 : 1;
+    cv::Vec2f n(eigenvectors(max_idx, 0), eigenvectors(max_idx, 1));
+    
+    // 8. 泰勒展开求解亚像素偏移（文档公式23）
+    cv::Vec2f grad(I_x.at<float>(cy, cx), I_y.at<float>(cy, cx));
+    float numerator = grad.dot(n);
+    float denominator = n[0] * (H(0, 0)*n[0] + H(0, 1)*n[1]) +
+                       n[1] * (H(1, 0)*n[0] + H(1, 1)*n[1]);
+    
+    if (std::abs(denominator) < 1e-6) 
+        return cv::Point2f(-1, -1);
+    
+    float t = -numerator / denominator;
+
+    // 9. 约束偏移量（文档§2.4）
+    float max_t = 0.5f / std::max(std::abs(n[0]), std::abs(n[1]));
+    t = std::clamp(t, -max_t, max_t);
+
+    // 10. 计算最终坐标
+    return cv::Point2f(x + t * n[0], y + t * n[1]);
 }
 
 float LaserProcessor::interpolateChannel(const cv::Mat& img, float x, float y) {
@@ -94,6 +205,24 @@ float LaserProcessor::interpolateChannel(const cv::Mat& img, float x, float y) {
     float d = row1[xi+1];
     
     return a*(1-dx)*(1-dy) + b*dx*(1-dy) + c*(1-dx)*dy + d*dx*dy;
+}
+
+double LaserProcessor::interpolateChannel(const cv::Mat& img, double x, double y) {
+    int xi = std::clamp(static_cast<int>(x), 0, img.cols-2);
+    int yi = std::clamp(static_cast<int>(y), 0, img.rows-2);
+    
+    double dx = x - xi;
+    double dy = y - yi;
+    
+    const float* row0 = img.ptr<float>(yi);
+    const float* row1 = img.ptr<float>(yi+1);
+    
+    double a = row0[xi];
+    double b = row0[xi+1];
+    double c = row1[xi];
+    double d = row1[xi+1];
+    
+    return static_cast<double>(a*(1-dx)*(1-dy) + b*dx*(1-dy) + c*(1-dx)*dy + d*dx*dy);
 }
 
 float LaserProcessor::findSymmetricCenter(const cv::Mat& img, float x, float y, cv::Vec2f dir, float search_range) {
@@ -605,28 +734,28 @@ float LaserProcessor::findSymmetricCenter3(
     float R)
 {
     // 采样与拟合参数
-    const float step    = 0.05f;   // t 方向采样步长
+    const float step    = 0.1f;   // t 方向采样步长
 #ifdef DEBUG_CENTER_FIND
     // 准备可视化窗口
     cv::namedWindow("GrayProfile", cv::WINDOW_NORMAL);
 #endif
 
-    float extend_range = R + 2.0f;
+    float extend_range = R;
     // if (R < 5) extend_range += extend_range * 0.8f;
     // else if (R < 10) extend_range += extend_range * 0.7f;
     // else if (R > 10) extend_range += 5.0f;
 
     // 1. 全范围采样
-    std::vector<float> Ts, Vs;
-    for (float t = -3; t <= extend_range; t += step) {
+    std::vector<double> Ts, Vs;
+    for (float t = -2.0f; t <= extend_range; t += step) {
         Ts.push_back(t);
-        Vs.push_back(interpolateChannel(img, x + t*dir[0], y + t*dir[1]));
+        Vs.push_back(interpolateChannel(img, double(x + t*dir[0]), double(y + t*dir[1])));
     }
     int N = (int)Ts.size();
     if (N < 3) return FLT_MAX;
 
     // 2. 找到第一个峰值
-    float maxVal = -FLT_MAX;
+    double maxVal = -FLT_MAX;
     int peakIdx = -1;
     bool isRising = false;
     for (int i = 0; i < N; ++i) {
@@ -636,11 +765,19 @@ float LaserProcessor::findSymmetricCenter3(
             peakIdx = i;
         }
     }
-    float t_peak = Ts[peakIdx];
+    double t_peak = Ts[peakIdx];
     if (Vs[peakIdx] < 0.5f) return FLT_MAX;
 
-    // 确定第一个最大峰的下降沿边界（向右搜索）
+    // 确定第一个最大峰的上升和下降沿边界
+    int leftBound = peakIdx - 1;    // 初始化为峰顶位置
     int rightBound = peakIdx + 1;  // 初始化为峰顶位置
+    while (leftBound > 0) {
+        // 检测灰度值上升：表示上升沿开始
+        float diff = Vs[leftBound+1] - Vs[leftBound];
+        if ((diff <= 1e-3f && Vs[leftBound] <= 0.05) || Ts[leftBound] < -R-1) break;
+        leftBound--;
+    }
+    leftBound += 2;
     while (rightBound < N) {
         // 检测灰度值上升：表示下降沿结束
         float diff = Vs[rightBound] - Vs[rightBound-1];
@@ -650,40 +787,45 @@ float LaserProcessor::findSymmetricCenter3(
     rightBound -= 2;
  
     // 3. 平台检测 → res1
-    float res1 = FLT_MAX;
+    double res1 = FLT_MAX;
     {
-        float v0 = Vs[peakIdx];
+        double v0 = Vs[peakIdx];
         int L = peakIdx, Rg = peakIdx;
-        while (L>0 && std::fabs(Vs[L-1]-v0)<1e-6f) --L;
-        while (Rg+1<rightBound && std::fabs(Vs[Rg+1]-v0)<1e-6f) ++Rg;
-        if (Rg - L + 1 > 30) {
+        while (L>0 && std::fabs(Vs[L-1]-v0)<1e-5f) --L;
+        while (Rg+1<rightBound && std::fabs(Vs[Rg+1]-v0)<1e-5f) ++Rg;
+        if (Rg - L + 1 >= 10) { // 大于1个像素
             res1 = 0.5f*(Ts[L] + Ts[Rg]);
         }
     }
+#ifndef DEBUG_CENTER_FIND
+    // if (res1 != FLT_MAX) {
+    //     return res1;
+    // }
+#endif
 
     // 4. 抛物线拟合 → res2
     float res2 = FLT_MAX;
     {
         // 确定左右两侧长度
-        int leftLen = peakIdx;        // 左侧点个数（不包括峰值）
-        int rightLen = rightBound - 1 - peakIdx; // 右侧点个数（不包括峰值）
+        int leftLen = peakIdx - leftBound - 1;           // 左侧点个数（不包括峰值）
+        int rightLen = rightBound - 1 - peakIdx;        // 右侧点个数（不包括峰值）
 
         // 判断哪边更短，并获取短边末端索引和灰度值
-        int shortEnd;
+        int shortEnd = 0;
         float targetGray;
         int searchStart, searchEnd;
         
         if (leftLen < rightLen) {
             // 左侧较短
-            shortEnd = 0;
-            targetGray = Vs[0];
+            shortEnd = leftBound;
+            targetGray = Vs[leftBound];
             searchStart = peakIdx + 1;
             searchEnd = rightBound;
         } else {
             // 右侧较短
             shortEnd = rightBound;
             targetGray = Vs[rightBound];
-            searchStart = 0;
+            searchStart = leftBound;
             searchEnd = peakIdx - 1;
         }
 
@@ -740,8 +882,18 @@ float LaserProcessor::findSymmetricCenter3(
     }
 #endif
 
+    // 泰勒展开法 → res3
+    float dx = (Vs[peakIdx+1] - Vs[peakIdx-1]) / (2*step);
+    float dxx = (Vs[peakIdx+1] - 2*Vs[peakIdx] + Vs[peakIdx-1]) / (step*step);
+    float offset = - dx / dxx;
+    float res3 = Ts[peakIdx] + offset;
+#ifndef DEBUG_CENTER_FIND
+    // return res3;
+#endif
+
+    float left_bound = Ts[leftBound];
     float right_bound = Ts[rightBound];
-    float res3 = t_peak;
+    double res4 = t_peak;
 
 
 #ifdef DEBUG_CENTER_FIND
@@ -797,6 +949,8 @@ float LaserProcessor::findSymmetricCenter3(
         {res1, {0,255,0}, "res1"},
         {res2, {255,0,0}, "res2"},
         {res3, {255,255,0}, "res3"},
+        {res4, {255,111,200}, "res4"},
+        {left_bound, {128, 0, 128}, "l_bound"},
         {right_bound, {128, 0, 128}, "r_bound"}
     };
     int lx = W - 180, ly = 80, dy = 30;
@@ -814,7 +968,242 @@ float LaserProcessor::findSymmetricCenter3(
     cv::waitKey(0);
 #endif
 
+    return res4;
+}
+
+float LaserProcessor::findSymmetricCenter4(
+    const cv::Mat& img,
+    float x, float y,
+    cv::Vec2f dir,
+    float R)
+{
+    // 采样与拟合参数
+    const float step    = 0.1f;   // t 方向采样步长
+#ifdef DEBUG_CENTER_FIND
+    // 准备可视化窗口
+    cv::namedWindow("GrayProfile", cv::WINDOW_NORMAL);
+#endif
+
+    float extend_range = R;
+
+    // 1. 全范围采样
+    std::vector<float> Ts, Vs;
+    for (float t = -2.0f; t <= extend_range; t += step) {
+        float val = img.at<float>(y + t * dir[1], x + t * dir[0]);
+        Ts.push_back(t);
+        Vs.push_back(val);
+    }
+    int N = (int)Ts.size();
+    if (N < 3) return FLT_MAX;
+
+    // 2. 找到第一个峰值
+    float maxVal = -FLT_MAX;
+    int peakIdx = -1;
+    for (int i = 0; i < N; ++i) {
+        // 只考虑 t <= R 的点
+        if (Vs[i] > maxVal && Ts[i] <= R) {
+            maxVal = Vs[i];
+            peakIdx = i;
+        }
+    }
+    float t_peak = Ts[peakIdx];
+    if (Vs[peakIdx] < 125.0f) return FLT_MAX;
+
+    // 3. 平台检测 → res1
+    float res1 = FLT_MAX;
+    {
+        float v0 = Vs[peakIdx];
+        int L = peakIdx, Rg = peakIdx;
+        while (L>0 && std::fabs(Vs[L-1]-v0)<=20) --L;
+        while (Rg+1<N && std::fabs(Vs[Rg+1]-v0)<=20) ++Rg;
+        if (Rg - L + 1 >= 10) { // 大于1个像素
+            res1 = 0.5f*(Ts[L] + Ts[Rg]);
+        }
+    }
+#ifndef DEBUG_CENTER_FIND
+    // if (res1 != FLT_MAX) {
+    //     return res1;
+    // }
+#endif
+
+    // 4. 灰度值不为0的纳入求中心 → res2
+    float res2 = t_peak;
+    {
+        std::vector<float> fit_t;
+        for (int i = 0; i < Vs.size(); ++i) {
+            if (Vs[i] > 0.0f) fit_t.push_back(Ts[i]);
+        }
+        res2 = 0.5f * (fit_t.front() + fit_t.back()) + 0.1f;
+    }
+
+    // 5. 灰度值不为0的纳入求质心 → res3
+    float res3 = t_peak;
+    {
+        double num = 0.0, den = 0.0;
+        for (int i = 0; i < N; ++i) {
+            float val = Vs[i];
+            if (val > 0.0f) {
+                num += Ts[i] * val; // 加权坐标
+                den += val;         // 总“质量”
+            }
+        }
+        res3 = static_cast<float>(num / den) + 0.1f; // 质心
+    }
+
+
+#ifdef DEBUG_CENTER_FIND
+    //
+    // —— 可视化部分 —— 
+    //
+    int W = 800, H = 500;
+    cv::Mat prof_img(H, W, CV_8UC3, cv::Scalar(255,255,255));
+    int x0 = 60, y0 = H - 60;
+    int x1 = W - 200, y1 = 60;
+    // 0) 目前的点
+    cv::putText(prof_img, cv::format("%s%.3f%s%.3f%s", "Profile at (", x, ",", y,")"), 
+                cv::Point(50, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, {0,0,0}, 1);
+
+    // 1) 坐标轴
+    cv::line(prof_img, {x0, y0}, {x1, y0}, {0,0,0}, 1);
+    cv::line(prof_img, {x0, y0}, {x0, y1}, {0,0,0}, 1);
+
+    // 2) 刻度与标签
+    int n_xt = 5;
+    for (int i = 0; i <= n_xt; ++i) {
+        float t_tick = -extend_range + 2*extend_range * i / n_xt;
+        int xt = x0 + int((t_tick + extend_range)/(2*extend_range)*(x1 - x0));
+        cv::line(prof_img, {xt, y0-5}, {xt, y0+5}, {0,0,0},1);
+        cv::putText(prof_img, cv::format("%.2f", t_tick),
+                    {xt-20, y0+25}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {0,0,0},1);
+    }
+    int n_yt = 5;
+    for (int i = 0; i <= n_yt; ++i) {
+        int v_tick = (i * 255) / n_yt;
+        // 计算当前刻度对应的y坐标
+        int yt = y0 - static_cast<int>((v_tick / 255.0f) * (y0 - y1));
+        cv::line(prof_img, {x0-5, yt}, {x0+5, yt}, {0,0,0},1);
+        // 显示整数刻度标签
+        cv::putText(prof_img, cv::format("%d", v_tick),
+                    {x0-60, yt+5}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {0,0,0},1);
+    }
+
+    // 3) 全采样点 & 连线（灰）
+    for (int i = 0; i < N; ++i) {
+        int xx = x0 + int((Ts[i]+extend_range)/(2*extend_range)*(x1 - x0));
+        int yy = y0 - static_cast<int>((Vs[i] / 255.0f) * (y0 - y1));
+        cv::circle(prof_img, {xx,yy}, 3, {180,180,180}, -1);
+        if (i>0) {
+            int xx0 = x0 + int((Ts[i-1]+extend_range)/(2*extend_range)*(x1 - x0));
+            int yy0 = y0 - static_cast<int>((Vs[i-1] / 255.0f) * (y0 - y1));
+            cv::line(prof_img, {xx0,yy0}, {xx,yy}, {200,200,200},1);
+        }
+    }
+
+
+    // 4) 四条垂直标线 & 图例
+    struct Rst{ float t; cv::Scalar c; const char* lbl; };
+    std::vector<Rst> rst = {
+        {res1, {0,255,0}, "res1"},
+        {res2, {255,0,0}, "res2"},
+        {res3, {255,255,0}, "res3"}
+    };
+    int lx = W - 180, ly = 80, dy = 30;
+    for (auto &r : rst) {
+        if (r.t==FLT_MAX) continue;
+        int xx = x0 + int((r.t+extend_range)/(2*extend_range)*(x1 - x0));
+        cv::line(prof_img, {xx, y1}, {xx, y0}, r.c, 1);
+        cv::putText(prof_img,
+            cv::format("%s: %.3f", r.lbl, r.t),
+            {lx, ly}, cv::FONT_HERSHEY_SIMPLEX, 0.6, r.c, 2);
+        ly += dy;
+    }
+
+    cv::imshow("GrayProfile", prof_img);
+    cv::waitKey(0);
+#endif
+
     return res3;
+}
+
+std::vector<float> LaserProcessor::sampleProfileAlongNormal(
+    const cv::Mat& img, 
+    float x, float y, 
+    const cv::Vec2f& n, 
+    float sample_step,
+    float search_range
+) {
+    std::vector<float> profile;
+    
+    // 双线性插值采样
+    auto bilinearSample = [](const cv::Mat& img, float x, float y) -> float {
+        int x0 = static_cast<int>(std::floor(x));
+        int y0 = static_cast<int>(std::floor(y));
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        
+        float dx = x - x0;
+        float dy = y - y0;
+        
+        float f00 = img.at<float>(y0, x0);
+        float f10 = img.at<float>(y0, x1);
+        float f01 = img.at<float>(y1, x0);
+        float f11 = img.at<float>(y1, x1);
+        
+        return f00 * (1-dx)*(1-dy) + 
+               f10 * dx*(1-dy) + 
+               f01 * (1-dx)*dy + 
+               f11 * dx*dy;
+    };
+    
+    // 沿法向正负方向采样
+    for (float t = -search_range; t <= search_range; t += sample_step) {
+        float sample_x = x + t * n[0];
+        float sample_y = y + t * n[1];
+        
+        if (sample_x >= 1 && sample_x < img.cols - 2 && 
+            sample_y >= 1 && sample_y < img.rows - 2) {
+            profile.push_back(bilinearSample(img, sample_x, sample_y));
+        }
+    }
+    
+    return profile;
+}
+
+float LaserProcessor::solveSubpixelCenter(
+    const std::vector<float>& profile,
+    const cv::Vec2f& n,
+    const cv::Matx22f& H,
+    float sample_step
+) {
+    // 寻找灰度极大值位置
+    int max_idx = 0;
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < profile.size(); ++i) {
+        if (profile[i] > max_val) {
+            max_val = profile[i];
+            max_idx = i;
+        }
+    }
+    
+    // 三点抛物线拟合
+    if (max_idx > 0 && max_idx < profile.size() - 1) {
+        float y0 = profile[max_idx - 1];
+        float y1 = profile[max_idx];
+        float y2 = profile[max_idx + 1];
+        float offset = 0.5f * (y0 - y2) / (y0 - 2*y1 + y2);
+        return (max_idx - profile.size()/2.0f + offset) * sample_step;
+    }
+    
+    // 泰勒展开解析解（文档公式23）
+    cv::Vec2f gradient(H.val[0], H.val[1]); // ∇I = [r_x, r_y]
+    float numerator = gradient.dot(n);
+    float denominator = n.dot(H * n);
+    
+    if (std::abs(denominator) > 1e-6) {
+        return -numerator / denominator;
+    }
+    
+    return FLT_MAX;
 }
 
 std::vector<cv::Point2f> LaserProcessor::processCenters(const std::map<float,float>& orig)
@@ -1055,7 +1444,7 @@ std::vector<LaserLine> LaserProcessor::extractLine(
         // auto [dx_kernel, dy_kernel, ksize] = computeGaussianDerivatives(sigma_val, roi_angle, h_is_long_edge);
         const float laser_width = max_search_range;
         const float sigma_val = convert_to_odd_number(laser_width / (2 * std::sqrt(3.0f)));
-        auto [dx_kernel, dy_kernel, ksize] = computeGaussianDerivatives(sigma_val);
+        auto [dx_kernel, dy_kernel, ksize] = computeGaussianDerivatives(sigma_val, 90 * CV_PI / 180.0f, true);
         cv::Mat dx, dy;
         cv::filter2D(rectify_img_float, dx, CV_32F, dx_kernel);
         cv::filter2D(rectify_img_float, dy, CV_32F, dy_kernel);
@@ -1085,8 +1474,15 @@ std::vector<LaserLine> LaserProcessor::extractLine2(
     int img_idx) {
     std::vector<LaserLine> laser_lines;
     cv::Mat rectify_img_float;
-    rectify_img.convertTo(rectify_img_float, CV_32F, 1.0f / 255.0f);
+    rectify_img.convertTo(rectify_img_float, CV_32F);
     
+    // debug查看原始中心点分布
+    // int scale = 10;
+    // cv::Size expand_size(rectify_img.cols * scale, rectify_img.rows * scale);
+    // cv::Mat orign_centers_vis;
+    // cv::cvtColor(rectify_img, orign_centers_vis, cv::COLOR_GRAY2BGR);
+    // cv::resize(orign_centers_vis, orign_centers_vis, expand_size, 0, 0, cv::INTER_NEAREST);
+
     for (size_t i = 0; i < contours.size(); ++i) {
         const auto& edge_pair = contours[i];
 
@@ -1103,8 +1499,8 @@ std::vector<LaserLine> LaserProcessor::extractLine2(
         cv::Point2f axis = p2 - p1;
         float axis_len = cv::norm(axis);
         cv::Point2f axis_dir = axis / axis_len;
-        float min_proj = 0.03f * axis_len;
-        float max_proj = 0.97f * axis_len;
+        float min_proj = 0.05f * axis_len;
+        float max_proj = 0.95f * axis_len;
 
         // 3. 激光线中心点提取
         cv::Mat laser_center_vis;
@@ -1116,18 +1512,19 @@ std::vector<LaserLine> LaserProcessor::extractLine2(
             float proj = vec.dot(axis_dir);
             if (proj <= min_proj || proj >= max_proj) continue;
 
-            float search_range = (p.second.y - p.first.y + 1);
-            cv::Vec2f dir(0, 1);
+            float search_range = (p.second.x - p.first.x + 1);
+            cv::Vec2f dir(1, 0);
             if (search_range > max_search_range) max_search_range = search_range;
 
             // if (x == 1755 && y == 647)
                 // puts("");
          
             // float t_peak = FLT_MAX;
-            // if ((p.first.x >= 1226 && p.first.x <= 1239) && (p.first.y >= 32 && p.first.y <= 48))
+            // if ((p.first.x >= 850 && p.first.x <= 885) && (p.first.y >= 563 && p.first.y <= 563))
                 // t_peak = findSymmetricCenter3(rectify_img_float, p.first.x, p.first.y, dir, search_range);
 
-            float t_peak = findSymmetricCenter3(rectify_img_float, p.first.x, p.first.y, dir, search_range);
+            // float t_peak = findSymmetricCenter3(rectify_img_float, p.first.x, p.first.y, dir, search_range);
+            float t_peak = findSymmetricCenter4(rectify_img_float, p.first.x, p.first.y, dir, search_range);
             if (t_peak == FLT_MAX) continue;
             float center_x = p.first.x + t_peak*dir[0], center_y = p.first.y + t_peak * dir[1];
 
@@ -1138,39 +1535,121 @@ std::vector<LaserLine> LaserProcessor::extractLine2(
             laser_center_vis.at<cv::Vec3b>(cv::Point(center.x, center.y)) = cv::Vec3b(0, 255, 0); // 绿色表示中心点
         }
 
-
+        // debug查看原始中心点分布
+        // for (const auto& [y, x] : orign_centers)
+        //     orign_centers_vis.at<cv::Vec3b>(static_cast<int>(y * scale), static_cast<int>(x * scale)) = cv::Vec3b(255, 0, 255);
 
         // 4. 同一条线相邻中心点插值为整数
-        cv::Mat new_centers_vis;
-        cv::cvtColor(rectify_img, new_centers_vis, cv::COLOR_GRAY2BGR);
         std::vector<cv::Point2f> new_centers = processCenters(orign_centers);
-        for (const auto& p : new_centers) new_centers_vis.at<cv::Vec3b>(cv::Point(std::round(p.x), p.y)) = cv::Vec3b(0, 255, 0); // 绿色表示中心点
-    
 
         // 5. 存储结果
-        // const float roi_angle = roi.angle * CV_PI / 180.0f;
-        // const float laser_width = max_search_range * sin(roi_angle);
+        // const float laser_width = max_search_range;
         // const float sigma_val = convert_to_odd_number(laser_width / (2 * std::sqrt(3.0f)));
-        // const bool h_is_long_edge = roi.size.height >= roi.size.width;
-        // auto [dx_kernel, dy_kernel, ksize] = computeGaussianDerivatives(sigma_val, roi_angle, h_is_long_edge);
-        const float laser_width = max_search_range;
-        const float sigma_val = convert_to_odd_number(laser_width / (2 * std::sqrt(3.0f)));
-        auto [dx_kernel, dy_kernel, ksize] = computeGaussianDerivatives(sigma_val);
-        cv::Mat dx, dy;
-        cv::filter2D(rectify_img_float, dx, CV_32F, dx_kernel);
-        cv::filter2D(rectify_img_float, dy, CV_32F, dy_kernel);
+        // auto [dx_kernel, dy_kernel, ksize] = computeGaussianDerivatives(sigma_val);
+        // cv::Mat dx, dy;
+        // cv::filter2D(rectify_img_float, dx, CV_32F, dx_kernel);
+        // cv::filter2D(rectify_img_float, dy, CV_32F, dy_kernel);
         std::map<float, LaserPoint> best_points;
         for (const auto& p : new_centers) {
-            float gx = interpolateChannel(dx, p.x, p.y);
-            float gy = interpolateChannel(dy, p.x, p.y);
-            best_points[p.y] = {p.x, p.y, gx, gy};
+            // float gx = interpolateChannel(dx, p.x, p.y);
+            // float gy = interpolateChannel(dy, p.x, p.y);
+            best_points[p.y] = {p.x, p.y, 0, 0};
         }
         LaserLine best_line;
         best_line.addPoints(best_points);
         laser_lines.emplace_back(best_line);
     }
+
+    // cv::imwrite(debug_img_dir / ("laser_orign_img" + std::to_string(img_idx) + ".bmp"), orign_centers_vis);
     
     return laser_lines;
+}
+
+
+std::vector<LaserLine> LaserProcessor::extractLine3(
+    const cv::Mat& rectify_img,
+    std::vector<std::vector<std::pair<cv::Point, cv::Point>>> contours,
+    int img_idx) {
+    cv::Mat rectify_img_float;
+    rectify_img.convertTo(rectify_img_float, CV_32F);
+    
+    // debug查看原始中心点分布
+    int scale = 10;
+    cv::Size expand_size(rectify_img.cols * scale, rectify_img.rows * scale);
+    cv::Mat orign_centers_vis;
+    cv::cvtColor(rectify_img, orign_centers_vis, cv::COLOR_GRAY2BGR);
+    cv::resize(orign_centers_vis, orign_centers_vis, expand_size, 0, 0, cv::INTER_NEAREST);
+
+    std::vector<LaserLine> out_lines;
+    // 参数
+    const int MIN_LEN = 5; // 最小点数的激光线才返回
+    const float MIN_WIDTH = 1.0f; // 最小有效宽（像素）
+    const float EPS_A = 1e-4f; // 避免 log(0)
+    const float MAX_A = 0.98f; // 最大不对称度，防止数值爆炸
+    
+    // 遍历每条 contour（每条 contour 是一个左右边缘点对的集合）
+    for (const auto& contour : contours) {
+        std::map<float, float> orign_centers;
+        for (const auto& lr : contour) {
+            const cv::Point& lp = lr.first;     // left edge point
+            const cv::Point& rp = lr.second;    // right edge point
+            const float width = fabs(rp.x - lp.x);
+
+            // 初始中心
+            float cx = 0.5f * (lp.x + rp.x);
+            float cy = lp.y;
+
+            // 估计边缘梯度
+            float gL = fabs(estimateGradientAtX(rectify_img_float, lp.x, cy));
+            float gR = fabs(estimateGradientAtX(rectify_img_float, rp.x, cy));
+            // 若梯度都很小，直接用中心，不做偏置校正
+            if (gL + gR < 1e-3f) {
+                orign_centers[cy] = cx;
+                continue;
+            }
+
+            // 估计不对称度 a: a = 1 - minGrad/maxGrad
+            float minG = std::min(gL, gR);
+            float maxG = std::max(gL, gR);
+            float a = 1.0f - (minG / (maxG + 1e-9f));
+            a = clampFloat(a, 0.0f, MAX_A);
+            
+            float w = width * 0.5f; // 估计真实半宽 w (Steger 定义: 2w 为整宽)
+            float sigma = std::max(0.6f, w / std::sqrt(3.0f));  // sigma >= w / sqrt(3)
+
+            // 计算偏置量 l = - (sigma^2/(2w)) * ln(1-a)
+            float one_minus_a = clampFloat(1.0f - a, EPS_A, 1.0f);
+            float l_mag = - (sigma * sigma) / (2.0f * w) * std::log(one_minus_a);
+            if (!std::isfinite(l_mag)) l_mag = 0.0f;
+
+            // 判定弱边（梯度小的一侧）
+            bool leftWeak = (gL < gR);
+            float l_signed = leftWeak ? -l_mag : l_mag; // 朝弱边为正
+            float center_corrected = cx - l_signed; // 论文中：estimated_center = true_center + l_signed
+
+            orign_centers[cy] = center_corrected;
+        }
+
+        // debug查看原始中心点分布
+        for (const auto& [y, x] : orign_centers)
+            orign_centers_vis.at<cv::Vec3b>(static_cast<int>(y * scale), static_cast<int>(x * scale)) = cv::Vec3b(255, 0, 255);
+
+        // 同一条线相邻中心点插值为整数
+        std::vector<cv::Point2f> new_centers = processCenters(orign_centers);
+
+        // 存储结果
+        std::map<float, LaserPoint> best_points;
+        for (const auto& p : new_centers) {
+            best_points[p.y] = {p.x, p.y, 0, 0};
+        }
+        LaserLine best_line;
+        best_line.addPoints(best_points);
+        out_lines.emplace_back(best_line);
+    }
+
+    cv::imwrite(debug_img_dir / ("laser_orign_img" + std::to_string(img_idx) + ".bmp"), orign_centers_vis);
+    
+    return out_lines;
 }
 
 
@@ -2099,61 +2578,61 @@ std::vector<std::tuple<int,int,int>> LaserProcessor::match4(
 
 
 /************************************** Match Five **************************************/
-// 改进的得分计算函数，考虑距离方差和长度归一化
 float LaserProcessor::computeEnhancedScore(
     const std::vector<std::pair<float, float>>& distance_pairs,
-    int pts_repro_cnt) {
-    
-    if (distance_pairs.empty()) return FLT_MAX;
-    
-    // 1. 计算平均距离
-    float sum_dist = 0.0f;
-    for (const auto& [y, d] : distance_pairs) {
-        sum_dist += d;
-    }
-    float avg_dist = sum_dist / distance_pairs.size();
-    
-    // 2. 计算距离方差
+    int pts_repro_cnt, float& coverage, float& std_dev) {
+
+    if (distance_pairs.empty() || pts_repro_cnt <= 0)
+        return FLT_MAX;
+
+    // 提取距离
+    std::vector<float> distances;
+    distances.reserve(distance_pairs.size());
+    for (const auto& [y, d] : distance_pairs)
+        distances.push_back(d);
+
+    // 1. 距离中位数
+    std::nth_element(distances.begin(), distances.begin() + distances.size() / 2, distances.end());
+    float median_dist = distances[distances.size() / 2];
+
+    // 2. 标准差（表示距离分布是否均匀）
+    float sum_dist = std::accumulate(distances.begin(), distances.end(), 0.0f);
+    float mean = sum_dist / distances.size();
     float variance = 0.0f;
-    for (const auto& [y, d] : distance_pairs) {
-        float diff = d - avg_dist;
+    for (float d : distances) {
+        float diff = d - mean;
         variance += diff * diff;
     }
-    variance /= distance_pairs.size();
-    float std_dev = std::sqrt(variance);
-    
-    // 3. 计算覆盖率
-    float coverage = float(distance_pairs.size()) / pts_repro_cnt;
-    
-    // 4. 长度归一化惩罚
-    // 对短线施加更严格的要求
-    float length_penalty = 1.0f;
-    if (pts_repro_cnt < 60) {
-        // 短线惩罚：线越短，惩罚越重
-        length_penalty = 1.0f + (60.0f - pts_repro_cnt) * 0.05f;
-    }
-    
-    // 5. 距离一致性惩罚（进一步增大惩罚力度）
-    // 标准差大说明距离分布不均匀，应该被重点惩罚
-    float consistency_penalty = 1.0f + std_dev * 1.5f;
-    
-    // 对于标准差过大的情况，施加更严厉的惩罚
-    if (std_dev > 2.5f) {
-        // 指数增长的惩罚，严重不一致的匹配会被大幅惩罚
-        consistency_penalty *= (1.0f + std::pow(std_dev - 2.5f, 1.5f) * 0.3f);
-    }
-    
-    // 6. 综合得分计算（越低越好）
-    // 基础得分：平均距离 + 覆盖率惩罚（进一步减少覆盖率惩罚影响）
-    // float base_score = avg_dist * 0.5f + (1.0f - coverage) * 1.2f;  // 覆盖率权重进一步降到1.2f
-    float base_score = avg_dist * 0.1f + (1.0f - coverage) * 3.5f; 
-    
-    // printf("avg_dist: %.2f / std_dev: %.2f / cov: %.2f / base_score: %.2f\n", avg_dist, std_dev, coverage, base_score);
+    variance /= distances.size();
+    std_dev = std::sqrt(variance);
 
-    // 应用惩罚因子
-    float final_score = base_score * consistency_penalty * length_penalty;
-    
-    return final_score;
+    // 3. 覆盖率
+    coverage = static_cast<float>(distance_pairs.size()) / pts_repro_cnt;
+
+    // 4. 线长惩罚（惩罚过短的线）
+    float short_penalty = 0.0f;
+    const int min_len_thresh = 250;
+    if (pts_repro_cnt < min_len_thresh) {
+        short_penalty = (min_len_thresh - pts_repro_cnt) * 0.15f;  // 可调节
+    }
+
+    // 5. 综合评分（越小越好）
+    // 加权组合各项评分
+    const float w_median = 0.25f;     // 中位距离权重
+    const float w_stddev = (int)distance_pairs.size() > min_len_thresh ? 1.5 : 2.5;     // 距离一致性权重
+    const float w_coverage = 23.0f;   // 覆盖率惩罚权重
+    const float w_short = 1.0f;      // 线长惩罚权重
+
+    float score =
+        w_median * median_dist +
+        w_stddev * std_dev +
+        w_coverage * (0.9f - coverage) +
+        w_short * short_penalty;
+
+    // printf("median_dist: %.2f / std_dev: %.2f / cov_pen: %.2f / match_p_cnt: %d / short_pen: %.2f / score: %.2f\n",
+    //         median_dist, std_dev, (0.9f - coverage), (int)distance_pairs.size(), short_penalty, score);
+
+    return score;
 }
 
 
@@ -2176,7 +2655,7 @@ std::vector<IntervalMatch> LaserProcessor::match5(
     constexpr float D_thresh = 20.0f;
     constexpr float S_thresh = 20.0f;
     constexpr float Delta_thresh = 3.0f;
-    constexpr int MIN_LEN = 45; // 存在问题：大一些会过滤掉正确导致匹配错误，小一些容易配错
+    constexpr int MIN_LEN = 80; // 存在问题：大一些会过滤掉正确导致匹配错误，小一些容易配错
 
     int L = (int)sample_points.size();
     int R = (int)laser_r.size();
@@ -2232,7 +2711,7 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                 int repro_cnt = 0;
                 const auto& coef = planes[p].coefficients;
                 std::map<int,std::vector<std::pair<float,float>>> support; // r_idx->(y,distance)
-                // if (l == 0 && p == 5)
+                // if (l == 5 && p == 1)
                 //     puts("");
                 for(auto [y_f, x_f]: pts) {
                     // 左侧已锁区跳过
@@ -2256,6 +2735,8 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                     repro_cnt++; repro_cnt_total++;
                     // 遍历右线
                     for (int r = 0; r < R; ++r) {
+                        // if (l == 5 && p ==1 && r == 5)
+                        //     puts("");
                         auto it = laser_r[r].points.lower_bound(yr);
                         if (it != laser_r[r].points.begin()) {
                             auto prev = std::prev(it);
@@ -2264,6 +2745,8 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                         }
                         if (fabs(it->first - yr) > EPS) continue;
                         float d = hypot(it->second.x - xr, it->second.y - yr);
+                        // if (r == 5 && p == 1 && l == 5)
+                        //     puts("");
                         if (d > D_thresh) continue;
                         bool skipR = false;
                         for (auto &iv : locked_r[r]) {
@@ -2276,7 +2759,6 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                 // 对每个右线构建子段集
                 for (auto &ent : support) {
                     auto &vec = ent.second;
-                    if ((int)vec.size() < MIN_LEN) continue;
                     std::sort(vec.begin(), vec.end(), [](auto &a, auto &b){ return a.first < b.first; });
                     // 拆分子段
                     std::vector<Interval> segs;
@@ -2300,8 +2782,7 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                     int total_count=0;
                     for (auto &iv: segs) total_count += iv.count;
                     if (total_count < MIN_LEN) continue;
-                    float coverage = total_count / float(repro_cnt);
-                    // 统一打分
+                    // 计算距离集合
                     std::vector<std::pair<float,float>> allpd;
                     for (auto &pd : vec) {
                         for (auto &iv : segs) 
@@ -2309,23 +2790,33 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                             if (pd.first>=iv.y_start-EPS && pd.first<=iv.y_end+EPS) { allpd.push_back(pd); break; }
                         }
                     }
-                    float score = computeEnhancedScore(allpd, repro_cnt);
+                    // 计算标准差
+                    float std_dev = 0.0f, coverage = 0.0f;
+                    // 统一打分
+                    float score = computeEnhancedScore(allpd, repro_cnt, coverage, std_dev);
                     if (score <= S_thresh) {
-                        cands.push_back({l, p, ent.first, segs, score, coverage});
+                        cands.push_back({l, p, ent.first, segs, score, coverage, std_dev});
                     }
                 }
             }
-            if (cands.empty() || cands[0].score < 0) continue;
+            if (cands.empty()) continue;
             
             // 如果唯一候选
             bool lock=false;
-            const auto& m = cands[0];
-            if(cands.size() == 1 && m.score <= 5.0f) lock = true;
+            auto& m = cands[0];
+            if(cands.size() == 1 && m.score <= 7.0f && m.coverage >= 0.65) lock = true;
+            else if (cands.size() == 1 && m.score <= 11.0f && m.coverage >= 0.70) lock = true;
+            else if (cands.size() == 1 && m.score <= 14.5f && m.coverage >= 0.85) lock = true;
+            else if (cands.size() == 1 && m.score <= 17.0f && m.coverage >= 0.91 && m.std_dev < 5.0f) lock = true;
             else if (cands.size() > 1) {
                 std::sort(cands.begin(),cands.end(),[](auto&a,auto&b){return a.score<b.score;});
-                const auto& mm = cands[1];
-                if (m.p_idx == mm.p_idx && mm.score - m.score <= 1.5) lock = true;
-                else if (mm.score - m.score >= 5.0f && m.score <= 12.0f && m.coverage >= 0.65) lock = true;
+                auto& mm = cands[1];
+                if (m.p_idx == mm.p_idx && fabs(mm.score - m.score) <= 1.5 && fabs(m.std_dev - mm.std_dev) < 1.0f) lock = true;
+                else if (fabs(mm.score - m.score) >= 10.0f && m.score <= 13.0f && m.coverage >= 0.65) lock = true;
+                else if (fabs(mm.score - m.score) <= 3.0f && fabs(m.std_dev - mm.std_dev) < 1.0f) {
+                    if (mm.coverage > m.coverage) std::swap(m, mm);
+                    if (m.coverage - mm.coverage > 0.6) lock = true;
+                }
             }
             if(lock) {
                 final_matches.push_back(m);
@@ -2384,7 +2875,7 @@ std::vector<IntervalMatch> LaserProcessor::match5(
                 // 右线ID
                 auto r_mid = laser_r[c.r_idx].points.begin(); std::advance(r_mid, laser_r[c.r_idx].points.size()/2);
                 cv::putText(vis, "R" + std::to_string(c.r_idx), cv::Point2f(r_mid->second.x+off, r_mid->second.y),
-                            cv::FONT_HERSHEY_SIMPLEX, 1.3, r_laser_col, 2);
+                            cv::FONT_HERSHEY_SIMPLEX, 1.3, {0,255,0}, 2);
                 // 文本：候选数
                 char text_buf[128];
                 snprintf(text_buf, sizeof(text_buf), "L%d->P%d->R%d (S %.2f / C %.2f%%)",
@@ -2670,15 +3161,15 @@ std::vector<IntervalMatch> LaserProcessor::match6(
                         continue;
                     }
                     
-                    // 计算覆盖率
-                    float coverage = static_cast<float>(total_count) / repro_cnt;
+                    // 覆盖率和距离标准差
+                    float coverage, std_dev;
                     
                     // 计算增强分数（此处简化，实际需实现）
-                    float score = computeEnhancedScore(points, repro_cnt);
+                    float score = computeEnhancedScore(points, repro_cnt, coverage, std_dev);
                     
                     if (score <= S_thresh + EPS) {
                         cands.push_back({
-                            l, p, r_idx, segs, score, coverage
+                            l, p, r_idx, segs, score, coverage, std_dev
                         });
                     }
                 }
@@ -2828,7 +3319,6 @@ std::vector<cv::Point3f> LaserProcessor::generateCloudPoints(
     return cloud_points;
 }
 
-// 基于 IntervalMatch 进行三维重建
 std::vector<cv::Point3f> LaserProcessor::generateCloudPoints2(
     const std::vector<IntervalMatch>& matches,
     const std::vector<LaserLine>& laser_l,
@@ -2841,32 +3331,32 @@ std::vector<cv::Point3f> LaserProcessor::generateCloudPoints2(
     for(const auto& m : matches) {
         std::vector<cv::Point2f> lp, rp;
         // 左右同一区间内点对
-    for(const auto& iv : m.intervals) {
-        for(float y=iv.y_start; y<=iv.y_end; y+=precision) {
-            // 左侧
-            auto itL = laser_l[m.l_idx].points.lower_bound(y);
-            if (itL != laser_l[m.l_idx].points.begin()) {
-                auto prevL = std::prev(itL);
-                if (itL == laser_l[m.l_idx].points.end() || fabs(prevL->first - y) < fabs(itL->first - y)) {
-                    itL = prevL;
+        for(const auto& iv : m.intervals) {
+            for(float y=iv.y_start; y<=iv.y_end; y+=precision) {
+                // 左侧
+                auto itL = laser_l[m.l_idx].points.lower_bound(y);
+                if (itL != laser_l[m.l_idx].points.begin()) {
+                    auto prevL = std::prev(itL);
+                    if (itL == laser_l[m.l_idx].points.end() || fabs(prevL->first - y) < fabs(itL->first - y)) {
+                        itL = prevL;
+                    }
                 }
-            }
-            // 右侧
-            auto itR = laser_r[m.r_idx].points.lower_bound(y);
-            if (itR != laser_r[m.r_idx].points.begin()) {
-                auto prevR = std::prev(itR);
-                if (itR == laser_r[m.r_idx].points.end() || fabs(prevR->first - y) < fabs(itR->first - y)) {
-                    itR = prevR;
+                // 右侧
+                auto itR = laser_r[m.r_idx].points.lower_bound(y);
+                if (itR != laser_r[m.r_idx].points.begin()) {
+                    auto prevR = std::prev(itR);
+                    if (itR == laser_r[m.r_idx].points.end() || fabs(prevR->first - y) < fabs(itR->first - y)) {
+                        itR = prevR;
+                    }
                 }
-            }
-            // 判断是否在精度范围内
-            if(itL != laser_l[m.l_idx].points.end() && fabs(itL->first - y) < EPS &&
-            itR != laser_r[m.r_idx].points.end() && fabs(itR->first - y) < EPS) {
-                lp.emplace_back(itL->second.x, y);
-                rp.emplace_back(itR->second.x, y);
+                // 判断是否在精度范围内
+                if(itL != laser_l[m.l_idx].points.end() && fabs(itL->first - y) < EPS &&
+                itR != laser_r[m.r_idx].points.end() && fabs(itR->first - y) < EPS) {
+                    lp.emplace_back(itL->second.x, y);
+                    rp.emplace_back(itR->second.x, y);
+                }
             }
         }
-    }
         if(lp.empty()) continue;
         cv::Mat pts4;
         cv::triangulatePoints(calib_info.P[0], calib_info.P[1], lp, rp, pts4);
@@ -2882,5 +3372,73 @@ std::vector<cv::Point3f> LaserProcessor::generateCloudPoints2(
     }
     return cloud;
 }
+
+std::vector<cv::Point3f> LaserProcessor::generateCloudPoints3(
+    const std::vector<IntervalMatch>& matches,
+    const std::vector<LaserLine>& laser_l,
+    const std::vector<LaserLine>& laser_r)
+{
+    std::vector<cv::Point3f> cloud;
+    const auto calib_info = ConfigManager::getInstance().getCalibInfo();
+
+    // 遍历每条匹配区间
+    int line_cnt = 0;
+    std::string txt_file = "test.txt";
+    std::ofstream ofs(txt_file, std::ios::app);
+    for(const auto& m : matches) {
+        std::vector<cv::Point2f> lp, rp;
+        // 左右同一区间内点对
+        for(const auto& iv : m.intervals) {
+            for(float y=iv.y_start; y<=iv.y_end; y+=precision) {
+                // 左侧
+                auto itL = laser_l[m.l_idx].points.lower_bound(y);
+                if (itL != laser_l[m.l_idx].points.begin()) {
+                    auto prevL = std::prev(itL);
+                    if (itL == laser_l[m.l_idx].points.end() || fabs(prevL->first - y) < fabs(itL->first - y)) {
+                        itL = prevL;
+                    }
+                }
+                // 右侧
+                auto itR = laser_r[m.r_idx].points.lower_bound(y);
+                if (itR != laser_r[m.r_idx].points.begin()) {
+                    auto prevR = std::prev(itR);
+                    if (itR == laser_r[m.r_idx].points.end() || fabs(prevR->first - y) < fabs(itR->first - y)) {
+                        itR = prevR;
+                    }
+                }
+                // 判断是否在精度范围内
+                if(itL != laser_l[m.l_idx].points.end() && fabs(itL->first - y) < EPS &&
+                itR != laser_r[m.r_idx].points.end() && fabs(itR->first - y) < EPS) {
+                    lp.emplace_back(itL->second.x, y);
+                    rp.emplace_back(itR->second.x, y);
+                }
+            }
+        }
+        if(lp.empty()) continue;
+
+        // 3D点重建
+        std::vector<cv::Point3f> pts3;
+        cv::Mat pts4;
+        cv::triangulatePoints(calib_info.P[0], calib_info.P[1], lp, rp, pts4);
+        for(int i=0;i<pts4.cols;++i){
+            float w = pts4.at<float>(3,i);
+            if(fabs(w)<1e-6) continue;
+            pts3.emplace_back(
+                pts4.at<float>(0,i)/w,
+                pts4.at<float>(1,i)/w,
+                pts4.at<float>(2,i)/w
+            );
+        }
+
+        ofs << "#Line " << line_cnt << ":\n";
+        for (const auto& pt : pts3) {
+            ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
+        }
+        ++line_cnt;
+    }
+    ofs.close();
+    return cloud;
+}
+
 
 /************************************************************************************* */

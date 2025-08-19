@@ -341,7 +341,7 @@ cv::Mat processImg2(const cv::Mat& img_origin, int is_right, bool have_laser) {
     cv::Mat binary_img;
     cv::adaptiveThreshold(denoised_img, binary_img, 255,
                          cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY,
-                         31, -17); // 21为窗口，10为偏置，可根据实际调整
+                         41, -13); // 31为窗口，17为偏置，可根据实际调整
 
     // 4. 形态学开运算，去除小噪声，保护细线
     int morph_size = std::min(binary_img.rows, binary_img.cols) > 2000 ? 3 : 1;

@@ -7,8 +7,8 @@
 
 int main() {
 
-    loadImgs();
-    // loadTrackImgs();
+    // loadImgs();
+    loadTrackImgs();
 
     bool is_load = loadStereoCalibInfo();
     if (!is_load) throw std::logic_error("can't load stereo calib info");
@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        // if (img_idx <= 8) continue;
+        // if (img_idx <= 2) continue;
         printf("idx: %d\n", (int)img_idx);
         
         //  极线校正
@@ -29,6 +29,10 @@ int main() {
             img_r
         );
         calib_info = ConfigManager::getInstance().getCalibInfo();
+
+        cv::Mat orig_l, orig_r;
+        orig_l = rectify_imgs_have_laser[0].clone();
+        orig_r = rectify_imgs_have_laser[1].clone();
 
         // 预处理图像
         cv::Mat bin_img_l, bin_img_r;
@@ -48,18 +52,26 @@ int main() {
 
         // 激光线中心点提取
         LaserProcessor laser_processor;
-        auto laser_l = laser_processor.extractLine2(laser_img_l, contours_l, img_idx);
-        auto laser_r = laser_processor.extractLine2(laser_img_r, contours_r, img_idx);
+        auto laser_l = laser_processor.extractLine3(laser_img_l, contours_l, img_idx);
+        auto laser_r = laser_processor.extractLine3(laser_img_r, contours_r, img_idx);
         cv::Mat vis_img_l = rectify_imgs_have_laser[0].clone();
         cv::Mat vis_img_r = rectify_imgs_have_laser[1].clone();
+        int scale = 10;
+        cv::Size new_size_l(vis_img_l.cols * scale, vis_img_l.rows * scale);
+        cv::Size new_size_r(vis_img_r.cols * scale, vis_img_r.rows * scale);
+        // 按指定尺寸缩放
+        cv::resize(vis_img_l, vis_img_l, new_size_l, 0, 0, cv::INTER_NEAREST);
+        cv::resize(vis_img_r, vis_img_r, new_size_r, 0, 0, cv::INTER_NEAREST);
         cv::cvtColor(vis_img_l, vis_img_l, cv::COLOR_GRAY2BGR);
         cv::cvtColor(vis_img_r, vis_img_r, cv::COLOR_GRAY2BGR);
         for (const auto& l : laser_l)
-            for (const auto& [y, p] : l.points) vis_img_l.at<cv::Vec3b>(y, p.x) = cv::Vec3b(255, 0, 255);
+            for (const auto& [y, p] : l.points)
+                vis_img_l.at<cv::Vec3b>(static_cast<int>(y * scale), static_cast<int>(p.x * scale)) = cv::Vec3b(255, 0, 255);
         for (const auto& l : laser_r)
-            for (const auto& [y, p] : l.points) vis_img_r.at<cv::Vec3b>(y, p.x) = cv::Vec3b(255, 0, 255);
-        cv::imwrite(debug_img_dir / ("laser_img_l" + std::to_string(img_idx) + ".jpg"), vis_img_l);
-        cv::imwrite(debug_img_dir / ("laser_img_r" + std::to_string(img_idx) + ".jpg"), vis_img_r);
+            for (const auto& [y, p] : l.points)
+                vis_img_r.at<cv::Vec3b>(static_cast<int>(y * scale), static_cast<int>(p.x * scale)) = cv::Vec3b(255, 0, 255);
+        cv::imwrite(debug_img_dir / ("laser_img_l" + std::to_string(img_idx) + ".bmp"), vis_img_l);
+        cv::imwrite(debug_img_dir / ("laser_img_r" + std::to_string(img_idx) + ".bmp"), vis_img_r);
 
         // 左线均匀采样
         std::vector<std::map<float, float>> sample_points_l(laser_l.size());
@@ -90,6 +102,9 @@ int main() {
         sort(laser_l.begin(), laser_l.end(), [](const auto& l1, const auto& l2){
             return l1.points.size() > l2.points.size();
         });
+        sort(laser_r.begin(), laser_r.end(), [](const auto& l1, const auto& l2){
+            return l1.points.size() > l2.points.size();
+        });
 
         for (size_t idx = 0; idx < laser_l.size(); ++idx) {
             std::map<float, float> mmp;
@@ -107,8 +122,8 @@ int main() {
         auto match_res = laser_processor.match5(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
         auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
 
-        std::string txt_file = std::to_string(img_idx);
-        std::ofstream ofs(txt_file + ".txt");
+        std::string txt_file = std::to_string(img_idx) + ".txt";
+        std::ofstream ofs(output_dir_ / txt_file);
         for (const auto& pt : cloud_points) {
             ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
         }
