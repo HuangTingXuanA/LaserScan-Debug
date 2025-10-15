@@ -643,336 +643,148 @@ void Two_PassNew4(
     std::vector<std::vector<std::pair<cv::Point, cv::Point>>>& final_contours,
     int img_idx)
 {
-    // 1. 预处理：断开虚假连接
+    // 1. 开始：形态学开操作（就地）
     static cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
     cv::morphologyEx(bin_img, bin_img, cv::MORPH_OPEN, kernel);
 
-    // 2. 单次连通区域分析
+    // 2. 连通域
     cv::Mat label, stats, centroids;
     int n_label = cv::connectedComponentsWithStats(bin_img, label, stats, centroids);
+    if (n_label <= 1) { final_contours.clear(); return; }
 
-    // 预分配内存
-    std::vector<bool> valid_regions(n_label, false);
-    std::vector<std::vector<std::pair<cv::Point, cv::Point>>> temp_contours(n_label);
+    // 移除线程相关容器，改为单个结果容器
+    std::vector<std::vector<std::pair<cv::Point, cv::Point>>> results;
 
-    // 3. 并行处理每个区域
-    #pragma omp parallel for
+    // Precompute stats pointers to avoid at<> overhead
+    std::vector<const int*> stats_ptrs(n_label);
+    for (int i = 0; i < n_label; ++i) {
+        stats_ptrs[i] = stats.ptr<int>(i);
+    }
+
+    // 串行循环处理区域（跳过背景0）
     for (int i = 1; i < n_label; ++i) {
-        int area = stats.at<int>(i, cv::CC_STAT_AREA);
-        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
-        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
-        float aspect = static_cast<float>(std::max(w, h)) / std::min(w, h);
-        
-        // 面积与长宽比过滤
-        if (area <= 200 || aspect <= 1.0f) {
-            continue;
-        }
-        
-        // 获取区域边界框
-        int x = stats.at<int>(i, cv::CC_STAT_LEFT);
-        int y = stats.at<int>(i, cv::CC_STAT_TOP);
-        int width = stats.at<int>(i, cv::CC_STAT_WIDTH);
-        int height = stats.at<int>(i, cv::CC_STAT_HEIGHT);
-        
-        // 提取左右边缘
+        const int* s = stats_ptrs[i];
+        int area = s[cv::CC_STAT_AREA];
+        int x = s[cv::CC_STAT_LEFT];
+        int y = s[cv::CC_STAT_TOP];
+        int width = s[cv::CC_STAT_WIDTH];
+        int height = s[cv::CC_STAT_HEIGHT];
+        int w = width, h = height;
+        if (area <= 200) continue;
+        int max_wh = std::max(w,h), min_wh = std::min(w,h);
+        if (min_wh <= 0) continue;
+        float aspect = static_cast<float>(max_wh) / min_wh;
+        if (aspect <= 1.0f) continue;
+
+        // 改为局部变量，移除thread_local
         std::vector<int> min_x_vec(height, std::numeric_limits<int>::max());
         std::vector<int> max_x_vec(height, std::numeric_limits<int>::min());
-        
-        // 直接扫描区域，避免使用findContours
+
+        // 扫描区域
         for (int row = y; row < y + height; ++row) {
             const int* label_ptr = label.ptr<int>(row);
             const uchar* bin_ptr = bin_img.ptr<uchar>(row);
-            
-            for (int col = x; col < x + width; ++col) {
+            int rel_row = row - y;
+            int col0 = x;
+            int col1 = x + width;
+            for (int col = col0; col < col1; ++col) {
                 if (label_ptr[col] == i && bin_ptr[col] == 255) {
-                    int rel_row = row - y;
                     if (col < min_x_vec[rel_row]) min_x_vec[rel_row] = col;
                     if (col > max_x_vec[rel_row]) max_x_vec[rel_row] = col;
                 }
             }
         }
-        
-        // 构建边缘映射
-        std::map<int, int> edge_minX_map, edge_maxX_map;
-        for (int rel_row = 0; rel_row < height; ++rel_row) {
-            if (min_x_vec[rel_row] != std::numeric_limits<int>::max()) {
-                int abs_row = y + rel_row;
-                edge_minX_map[abs_row] = min_x_vec[rel_row];
-                edge_maxX_map[abs_row] = max_x_vec[rel_row];
+
+        // 构建紧凑的Ys,Xmins,Xmaxs数组
+        std::vector<int> Ys; Ys.reserve(height);
+        std::vector<int> Xmins; Xmins.reserve(height);
+        std::vector<int> Xmaxs; Xmaxs.reserve(height);
+        for (int r = 0; r < height; ++r) {
+            if (min_x_vec[r] != std::numeric_limits<int>::max()) {
+                Ys.push_back(y + r);
+                Xmins.push_back(min_x_vec[r]);
+                Xmaxs.push_back(max_x_vec[r]);
             }
         }
-        
-        // 边缘平滑度计算
-        auto computeSmoothness = [](const std::map<int, int>& edge_map) -> float {
-            if (edge_map.size() < 2) return 0.0f;
-            
-            float total_diff = 0.0f;
-            int valid_pairs = 0;
-            auto it = edge_map.begin();
-            int prev_y = it->first;
-            int prev_x = it->second;
-            ++it;
-            
-            for (; it != edge_map.end(); ++it) {
-                int curr_y = it->first;
-                int curr_x = it->second;
-                
-                if (curr_y == prev_y + 1) {
-                    float dx = static_cast<float>(std::abs(curr_x - prev_x));
-                    total_diff += dx;
-                    valid_pairs++;
-                }
-                prev_y = curr_y;
-                prev_x = curr_x;
+        if (Ys.size() < 2) continue;
+
+        // 计算平滑度
+        auto computeSmoothFast = [&](const std::vector<int>& arr)->float {
+            float total = 0.0f; int cnt = 0;
+            for (size_t k = 1; k < arr.size(); ++k) {
+                total += std::abs(arr[k] - arr[k-1]);
+                ++cnt;
             }
-            
-            return valid_pairs > 0 ? total_diff / valid_pairs : 0.0f;
+            return cnt ? total / cnt : 0.0f;
         };
-        
-        // 边缘平滑度过滤
-        float left_smooth = computeSmoothness(edge_minX_map);
-        float right_smooth = computeSmoothness(edge_maxX_map);
-        float std_thresh = 1.5f;
-        
-        if (left_smooth > std_thresh || right_smooth > std_thresh) {
-            continue;
-        }
-        
-        // 准备有序的 y、x_min、x_max 列表
-        std::vector<int> Ys;
-        std::vector<int> Xmins, Xmaxs;
-        for (auto& [y_val, x_min] : edge_minX_map) {
-            Ys.push_back(y_val);
-            Xmins.push_back(x_min);
-            Xmaxs.push_back(edge_maxX_map[y_val]);
-        }
-        
-        // 检测跳变
-        const int jump_thresh = 5;
-        std::vector<std::pair<int, int>> bad_ranges;
-        
-        int n_edge_p = Ys.size();
+        std::vector<int> lefts(Xmins.begin(), Xmins.end());
+        std::vector<int> rights(Xmaxs.begin(), Xmaxs.end());
+        float left_smooth = computeSmoothFast(lefts);
+        float right_smooth = computeSmoothFast(rights);
+        const float std_thresh = 1.5f;
+        if (left_smooth > std_thresh || right_smooth > std_thresh) continue;
+
+        // 检测跳跃范围
+        const int jump_thresh = 7;
+        std::vector<std::pair<int,int>> bad_ranges;
+        int n_edge_p = (int)Ys.size();
         if (n_edge_p > 1) {
             int j = 1;
             int prev_w = Xmaxs[0] - Xmins[0];
-            
             while (j < n_edge_p) {
                 int cur_w = Xmaxs[j] - Xmins[j];
-                
                 if (cur_w - prev_w >= jump_thresh) {
                     int bad_y = Ys[j];
                     int bad_x = Xmins[j];
-                    
                     int end_j = j + 1;
                     for (; end_j < n_edge_p; ++end_j) {
-                        if (Xmaxs[end_j] == bad_x) {
-                            break;
-                        }
+                        if (Xmaxs[end_j] == bad_x) break;
                     }
-                    
                     int end_y = (end_j < n_edge_p) ? Ys[end_j] : Ys.back();
                     bad_ranges.emplace_back(bad_y, end_y);
-                    
                     if (end_j + 1 < n_edge_p) {
                         prev_w = Xmaxs[end_j + 1] - Xmins[end_j + 1];
                         j = end_j + 2;
-                    } else {
-                        break;
-                    }
+                    } else break;
                 } else {
                     prev_w = cur_w;
                     ++j;
                 }
             }
         }
-        
-        // 过滤跳变区间内的极
+
+        // 收集有效边缘对
         std::vector<std::pair<cv::Point, cv::Point>> edge_pair;
+        edge_pair.reserve(Ys.size());
         for (size_t idx = 0; idx < Ys.size(); ++idx) {
-            int y = Ys[idx];
-            int x_min = Xmins[idx];
-            int x_max = Xmaxs[idx];
-            
-            // 检查是否在跳变区间
+            int yy = Ys[idx];
             bool in_bad = false;
-            for (auto& [sy, ey] : bad_ranges) {
-                if (y >= sy && y <= ey) {
-                    in_bad = true;
-                    break;
-                }
+            for (auto &br : bad_ranges) {
+                if (yy >= br.first && yy <= br.second) { in_bad = true; break; }
             }
-            
             if (in_bad) continue;
-            
-            float search_range = (x_max - x_min + 1);
+            int x_min = Xmins[idx], x_max = Xmaxs[idx];
+            int search_range = x_max - x_min + 1;
             if (search_range < 3 || search_range > 25) continue;
-            
-            edge_pair.emplace_back(cv::Point(x_min, y), cv::Point(x_max, y));
+            edge_pair.emplace_back(cv::Point(x_min, yy), cv::Point(x_max, yy));
         }
-        
         if (!edge_pair.empty()) {
-            #pragma omp critical
-            {
-                temp_contours[i] = edge_pair;
-                valid_regions[i] = true;
-            }
+            results.push_back(std::move(edge_pair));
         }
+    } // 循环结束
 
-        // 应用卡尔曼滤波
-        // if (!edge_pair.empty()) {
-        //     std::vector<int> left_ys, right_ys;
-        //     std::vector<float> left_smooth, right_smooth;
-            
-        //     // 提取左右边缘极
-        //     std::map<int, int> left_map, right_map;
-        //     for (const auto& p : edge_pair) {
-        //         left_map[p.first.y] = p.first.x;
-        //         right_map[p.first.y] = p.second.x;
-        //     }
-            
-        //     // 应用卡尔曼滤波
-        //     kalman_filter_edge(left_map, left_ys, left_smooth);
-        //     kalman_filter_edge(right_map, right_ys, right_smooth);
-            
-        //     // 构建滤波后的极对
-        //     std::vector<std::pair<cv::Point, cv::Point>> filtered_edge_pair;
-        //     std::map<int, float> left_filtered, right_filtered;
-            
-        //     for (size_t j = 0; j < left_ys.size(); j++) {
-        //         left_filtered[left_ys[j]] = left_smooth[j];
-        //     }
-        //     for (size_t j = 0; j < right_ys.size(); j++) {
-        //         right_filtered[right_ys[j]] = right_smooth[j];
-        //     }
-            
-        //     for (int y : left_ys) {
-        //         if (right_filtered.find(y) != right_filtered.end()) {
-        //             int x_min = static_cast<int>(std::round(left_filtered[y]));
-        //             int x_max = static_cast<int>(std::round(right_filtered[y]));
-                    
-        //             if (x_max > x_min && (x_max - x_min) >= 3 && (x_max - x_min) <= 25) {
-        //                 filtered_edge_pair.emplace_back(cv::Point(x_min, y), cv::Point(x_max, y));
-        //             }
-        //         }
-        //     }
-            
-        //     if (!filtered_edge_pair.empty()) {
-        //         #pragma omp critical
-        //         {
-        //             temp_contours[i] = filtered_edge_pair;
-        //             valid_regions[i] = true;
-        //         }
-        //     }
-        // }
-    }
-    
-    // 4. 收集所有有效区域
-    final_contours.clear();
-    for (int i = 1; i < n_label; ++i) {
-        if (valid_regions[i] && !temp_contours[i].empty()) {
-            final_contours.push_back(temp_contours[i]);
-        }
-    }
+    // 直接使用结果
+    final_contours = std::move(results);
 
-    // 5. 生成最终二值图像
+    // 生成 final mask
     bin_img.setTo(0);
-    for (const auto& edge_pair : final_contours) {
-        for (const auto& p : edge_pair) {
+    for (const auto &edge_pair : final_contours) {
+        for (const auto &p : edge_pair) {
             int y = p.first.y;
             int x_start = std::max(0, p.first.x - 1);
             int x_end = std::min(bin_img.cols - 1, p.second.x + 1);
-            
             uchar* row_ptr = bin_img.ptr<uchar>(y);
-            for (int x = x_start; x <= x_end; ++x) {
-                row_ptr[x] = 255;
-            }
-        }
-    }
-    
-    // 6. 最终过滤（基于面积和长宽比）
-    n_label = cv::connectedComponentsWithStats(bin_img, label, stats, centroids);
-    bin_img.setTo(0);
-    for (int i = 1; i < n_label; ++i) {
-        int area = stats.at<int>(i, cv::CC_STAT_AREA);
-        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
-        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
-        float aspect = static_cast<float>(std::max(w, h)) / std::min(w, h);
-        
-        if (area > 350 && aspect > 1.0) {
-            cv::Mat region_mask = (label == i);
-            bin_img.setTo(255, region_mask);
-        }
-    }
-
-    // 7. 根据最终的bin_img再次提取final_contours
-    final_contours.clear();
-    n_label = cv::connectedComponentsWithStats(bin_img, label, stats, centroids);
-    for (int i = 1; i < n_label; ++i) {
-        int area = stats.at<int>(i, cv::CC_STAT_AREA);
-        int w = stats.at<int>(i, cv::CC_STAT_WIDTH);
-        int h = stats.at<int>(i, cv::CC_STAT_HEIGHT);
-        float aspect = static_cast<float>(std::max(w, h)) / std::min(w, h);
-        
-        // 最终过滤条件
-        if (area > 350 && aspect > 1.0) {
-            // 获取区域边界框
-            int x = stats.at<int>(i, cv::CC_STAT_LEFT);
-            int y = stats.at<int>(i, cv::CC_STAT_TOP);
-            int width = stats.at<int>(i, cv::CC_STAT_WIDTH);
-            int height = stats.at<int>(i, cv::CC_STAT_HEIGHT);
-            
-            // 提取左右边缘
-            std::vector<int> min_x_vec(height, std::numeric_limits<int>::max());
-            std::vector<int> max_x_vec(height, std::numeric_limits<int>::min());
-            
-            for (int row = y; row < y + height; ++row) {
-                const int* label_ptr = label.ptr<int>(row);
-                const uchar* bin_ptr = bin_img.ptr<uchar>(row);
-                
-                for (int col = x; col < x + width; ++col) {
-                    if (label_ptr[col] == i && bin_ptr[col] == 255) {
-                        int rel_row = row - y;
-                        if (col < min_x_vec[rel_row]) min_x_vec[rel_row] = col;
-                        if (col > max_x_vec[rel_row]) max_x_vec[rel_row] = col;
-                    }
-                }
-            }
-            
-            // 构建边缘映射
-            std::map<int, int> edge_minX_map, edge_maxX_map;
-            for (int rel_row = 0; rel_row < height; ++rel_row) {
-                if (min_x_vec[rel_row] != std::numeric_limits<int>::max()) {
-                    int abs_row = y + rel_row;
-                    edge_minX_map[abs_row] = min_x_vec[rel_row];
-                    edge_maxX_map[abs_row] = max_x_vec[rel_row];
-                }
-            }
-            
-            // 准备有序的 y、x_min、x_max 列表
-            std::vector<int> Ys;
-            std::vector<int> Xmins, Xmaxs;
-            for (auto& [y_val, x_min] : edge_minX_map) {
-                Ys.push_back(y_val);
-                Xmins.push_back(x_min);
-                Xmaxs.push_back(edge_maxX_map[y_val]);
-            }
-            
-            // 构建边缘点对
-            std::vector<std::pair<cv::Point, cv::Point>> edge_pair;
-            for (size_t idx = 0; idx < Ys.size(); ++idx) {
-                int y = Ys[idx];
-                int x_min = Xmins[idx] - 5;
-                int x_max = Xmaxs[idx];
-                
-                float search_range = (x_max - x_min + 1);
-                if (search_range < 3 || search_range > 30) continue;
-                
-                edge_pair.emplace_back(cv::Point(x_min, y), cv::Point(x_max, y));
-            }
-            
-            if (!edge_pair.empty()) {
-                final_contours.push_back(edge_pair);
-            }
+            for (int x = x_start; x <= x_end; ++x) row_ptr[x] = 255;
         }
     }
 
