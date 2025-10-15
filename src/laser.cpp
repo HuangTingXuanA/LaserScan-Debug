@@ -3932,7 +3932,7 @@ LaserProcessor::match8(const std::vector<LaserLine> &laser_l,
               all_enhanced_cands.push_back(std::move(cand));
             }
 
-            if (l == 11 && r_idx == 4)
+            if (l == 2 && r_idx == 8)
                 printf("l%d-r%d, score: %.3f\n", l, r_idx, score);
           }
         }
@@ -4131,12 +4131,9 @@ LaserProcessor::match8(const std::vector<LaserLine> &laser_l,
     int SR = static_cast<int>(right_segments.size());
     int sn = std::max(SL, SR);
 
-    std::vector<std::vector<double>> seg_cost(
-        sn, std::vector<double>(sn, INF_COST));
-    std::vector<std::vector<IntervalMatch>> seg_best(
-        SL, std::vector<IntervalMatch>(SR));
-    std::vector<std::vector<bool>> seg_has_best(SL,
-                                                std::vector<bool>(SR, false));
+    std::vector<std::vector<double>> seg_cost(sn, std::vector<double>(sn, INF_COST));
+    std::vector<std::vector<IntervalMatch>> seg_best(SL, std::vector<IntervalMatch>(SR));
+    std::vector<std::vector<bool>> seg_has_best(SL, std::vector<bool>(SR, false));
 
     // 为段间生成候选（使用所有光平面）
     tbb::concurrent_vector<EnhancedCandidate> seg_cands;
@@ -4254,7 +4251,7 @@ LaserProcessor::match8(const std::vector<LaserLine> &laser_l,
 
                 seg_cands.push_back(std::move(seg_cand));
               }
-                if (score < 3.0f)
+                if (score < 10.0f)
                     printf("l%d-r%d, score: %.3f\n", left_seg.original_idx, right_seg.original_idx, score);
             }
           }

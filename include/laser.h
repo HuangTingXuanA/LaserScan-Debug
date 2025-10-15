@@ -143,7 +143,7 @@ public:
 private:
     const float roi_scale_ = 1.05f;
     const float D_thresh_ = 20.0f;
-    const float S_thresh_ = 4.0f;
+    const float S_thresh_ = 3.5f;
     const int MIN_LEN_ = 80;
     const float EPS_ = 1e-4f;
     const float precision_ = 0.5f;

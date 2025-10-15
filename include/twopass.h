@@ -721,34 +721,70 @@ void Two_PassNew4(
         std::vector<int> rights(Xmaxs.begin(), Xmaxs.end());
         float left_smooth = computeSmoothFast(lefts);
         float right_smooth = computeSmoothFast(rights);
-        const float std_thresh = 1.5f;
+        const float std_thresh = 1.8f;
         if (left_smooth > std_thresh || right_smooth > std_thresh) continue;
 
         // 检测跳跃范围
-        const int jump_thresh = 7;
-        std::vector<std::pair<int,int>> bad_ranges;
+        const int jump_thresh = 8;           // 绝对跳跃阈值
+        const float relative_thresh = 0.5f;  // 相对跳跃阈值（50%）
+        const int smooth_window = 5;         // 平滑窗口大小
+
+        std::vector<std::pair<int, int>> bad_ranges;
         int n_edge_p = (int)Ys.size();
-        if (n_edge_p > 1) {
-            int j = 1;
-            int prev_w = Xmaxs[0] - Xmins[0];
-            while (j < n_edge_p) {
-                int cur_w = Xmaxs[j] - Xmins[j];
-                if (cur_w - prev_w >= jump_thresh) {
-                    int bad_y = Ys[j];
-                    int bad_x = Xmins[j];
-                    int end_j = j + 1;
+
+        if (n_edge_p > smooth_window) {
+            // 计算宽度序列和其平滑值
+            std::vector<int> widths;
+            std::vector<float> smoothed_widths;
+            widths.reserve(n_edge_p);
+            smoothed_widths.reserve(n_edge_p);
+            
+            for (int j = 0; j < n_edge_p; ++j) {
+                int w = Xmaxs[j] - Xmins[j];
+                widths.push_back(w);
+            }
+            
+            // 简单移动平均平滑
+            for (int j = 0; j < n_edge_p; ++j) {
+                float sum = 0;
+                int count = 0;
+                for (int k = std::max(0, j - smooth_window/2); 
+                    k <= std::min(n_edge_p-1, j + smooth_window/2); ++k) {
+                    sum += widths[k];
+                    count++;
+                }
+                smoothed_widths.push_back(sum / count);
+            }
+            
+            // 检测异常跳跃
+            for (int j = 1; j < n_edge_p; ++j) {
+                float expected = smoothed_widths[j-1] + (smoothed_widths[j-1] - smoothed_widths[j-2]); // 简单预测
+                int actual = widths[j];
+                
+                // 双重条件：绝对跳跃和相对跳跃
+                bool is_jump = (actual - expected > jump_thresh) || 
+                            (actual > expected * (1 + relative_thresh));
+                
+                if (is_jump) {
+                    // 寻找异常区域的结束点（宽度回归正常范围）
+                    int start_y = Ys[j];
+                    int end_j = j;
                     for (; end_j < n_edge_p; ++end_j) {
-                        if (Xmaxs[end_j] == bad_x) break;
+                        float current_expected = smoothed_widths[end_j-1] + 
+                                            (smoothed_widths[end_j-1] - smoothed_widths[end_j-2]);
+                        // 宽度回归到预期值的附近
+                        if (std::abs(widths[end_j] - current_expected) < jump_thresh &&
+                            widths[end_j] < current_expected * (1 + relative_thresh)) {
+                            break;
+                        }
                     }
                     int end_y = (end_j < n_edge_p) ? Ys[end_j] : Ys.back();
-                    bad_ranges.emplace_back(bad_y, end_y);
-                    if (end_j + 1 < n_edge_p) {
-                        prev_w = Xmaxs[end_j + 1] - Xmins[end_j + 1];
-                        j = end_j + 2;
-                    } else break;
-                } else {
-                    prev_w = cur_w;
-                    ++j;
+                    
+                    // 只标记足够大的异常区域（避免单点噪声）
+                    if (end_y - start_y >= 3) {  // 至少3行的异常才被认为是反光
+                        bad_ranges.emplace_back(start_y, end_y);
+                    }
+                    j = end_j;  // 跳过已处理的异常区域
                 }
             }
         }

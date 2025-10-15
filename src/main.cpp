@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        // if (img_idx != 9) continue;
+        if (img_idx != 24) continue;
         printf("idx: %d\n", (int)img_idx);
         
         //  极线校正
@@ -48,6 +48,9 @@ int main() {
         std::vector<std::vector<std::pair<cv::Point, cv::Point>>> contours_l, contours_r;
         Two_PassNew4(bin_img_l, contours_l, img_idx);
         Two_PassNew4(bin_img_r, contours_r, img_idx);
+        auto t2 = std::chrono::high_resolution_clock::now();
+        duration_ms = std::chrono::duration<float, std::milli>(t2 - t1).count();
+        std::cout << "two pass time: " << duration_ms << " ms" << std::endl;
 
         // 只保留激光区域的原始像素
         cv::Mat laser_img_l = cv::Mat::zeros(rectify_imgs_have_laser[0].size(), CV_8UC1);
@@ -125,7 +128,7 @@ int main() {
         auto match_res = laser_processor.match8(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
         auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
         for (const auto& m_res : match_res)
-            printf("L%d - R%d - P%d - S%.3f\n", m_res.l_idx, m_res.r_idx, m_res.p_idx, m_res.score);
+            printf("L%d - R%d - P%d - S: %.3f\n", m_res.l_idx, m_res.r_idx, m_res.p_idx, m_res.score);
 
         // std::string txt_file = std::to_string(img_idx) + ".txt";
         // std::ofstream ofs(output_dir_ / txt_file);
