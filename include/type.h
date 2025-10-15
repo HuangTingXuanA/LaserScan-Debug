@@ -35,20 +35,16 @@ struct CalibrationResult {
 struct LaserPoint {
     float x;
     float y;
-    float gx = 0;   // 对应处的梯度 X 分量
-    float gy = 0;   // 对应处的梯度 Y 分量
 
-    // 梯度幅值和方向
-    float mag() const { return std::hypot(gx, gy); }
-    float dir() const { return std::atan2(gy, gx); }
-    
+    LaserPoint() : x(0), y(0) {}
+    LaserPoint(float x_, float y_) : x(x_), y(y_) {}
     // 相等性判断
     friend bool operator==(const LaserPoint& a, const LaserPoint& b) {
         return a.x == b.x && a.y == b.y; // 仅比较x,y坐标
     }
 };
 
-// 激光线
+// 激光线,extractLine2
 struct LaserLine {
     // points<y, point>
     std::map<float, LaserPoint> points;
@@ -61,6 +57,88 @@ struct LaserLine {
     // 获取点数量
     size_t size() const { return points.size(); }
 };
+
+// 对应extractLine3
+struct LaserLine2 {
+    std::vector<LaserPoint> points;     // 激光点数据
+    std::vector<float> y_coords;        // 对应的y坐标，保持有序以支持二分查找
+    
+    // 预留容量以减少重分配
+    void reserve(size_t capacity) {
+        points.reserve(capacity);
+        y_coords.reserve(capacity);
+    }
+
+    // 单个点添加
+    void addPoint(const LaserPoint& point, float y) {
+        // 找到插入位置以保持有序
+        auto it = std::lower_bound(y_coords.begin(), y_coords.end(), y);
+        size_t pos = std::distance(y_coords.begin(), it);
+        
+        points.insert(points.begin() + pos, point);
+        y_coords.insert(it, y);
+    }
+
+    // 批量添加点
+    void addPoints(std::vector<LaserPoint>&& newPoints, std::vector<float>&& coords) {
+        if (newPoints.size() != coords.size()) {
+            throw std::invalid_argument("Points and coordinates size mismatch");
+        }
+        
+        // 如果当前为空，直接移动
+        if (points.empty()) {
+            points = std::move(newPoints);
+            y_coords = std::move(coords);
+            return;
+        }
+        
+        // 合并并保持有序
+        size_t old_size = points.size();
+        points.insert(points.end(), 
+                     std::make_move_iterator(newPoints.begin()),
+                     std::make_move_iterator(newPoints.end()));
+        y_coords.insert(y_coords.end(),
+                       std::make_move_iterator(coords.begin()),
+                       std::make_move_iterator(coords.end()));
+    }
+
+    // 二分精度范围内查找 
+    const LaserPoint* findPoint(float y) const {
+        if (y_coords.empty()) return nullptr;
+        auto it = std::lower_bound(y_coords.begin(), y_coords.end(), y);
+
+        size_t idx = 0;
+        float min_dist = std::numeric_limits<float>::max();
+        const float eps = 1e-4f;
+
+        // 检查it
+        if (it != y_coords.end()) {
+            float dist = std::fabs(*it - y);
+            if (dist < min_dist) {
+                min_dist = dist;
+                idx = std::distance(y_coords.begin(), it);
+            }
+        }
+        // 检查prev(it)
+        if (it != y_coords.begin()) {
+            auto it_prev = std::prev(it);
+            float dist = std::fabs(*it_prev - y);
+            if (dist < min_dist) {
+                min_dist = dist;
+                idx = std::distance(y_coords.begin(), it_prev);
+            }
+        }
+        if (min_dist < eps) {
+            return &points[idx];
+        }
+        return nullptr;
+    }
+       
+    size_t size() const { return points.size(); }
+    bool empty() const { return points.empty(); }
+    void clear() { points.clear(); y_coords.clear(); }
+};
+
 
 
 // 激光平面标定结果

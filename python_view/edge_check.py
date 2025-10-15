@@ -289,7 +289,7 @@ def visualize_binary_comparison(before_img, after_img):
 
 # 加载并处理图像
 if __name__ == "__main__":
-    img_path = 'image.png'
+    img_path = 'image_2.png'
     bin_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     
     if bin_img is None:

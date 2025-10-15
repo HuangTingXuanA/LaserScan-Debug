@@ -7,8 +7,8 @@
 namespace fs = std::filesystem;
 
 inline std::vector<std::pair<cv::Mat, cv::Mat>> laser_imgs_;
-inline fs::path calib_info_dir_ = fs::current_path() / "calib_info_0813";
-inline fs::path laser_imgs_dir_ = fs::current_path() / "track_test3";
+inline fs::path calib_info_dir_ = fs::current_path() / "calib_info_1013";
+inline fs::path laser_imgs_dir_ = fs::current_path() / "laser_1013";
 inline fs::path output_dir_ = fs::current_path() / "cloud";
 inline fs::path debug_img_dir = fs::current_path() / "debug_img";
 

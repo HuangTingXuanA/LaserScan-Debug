@@ -3,6 +3,7 @@
 #include <atomic>
 #include <numeric>
 #include <regex>
+#include <opencv2/core/ocl.hpp>
 
 void loadImgs() {
     // 读取点云检测图片
@@ -325,7 +326,6 @@ cv::Mat processImg(const cv::Mat& img_origin, int is_right, bool have_laser) {
 }
 
 cv::Mat processImg2(const cv::Mat& img_origin, int is_right, bool have_laser) {
-    // 1. 灰度转换
     cv::Mat gray_img;
     if (img_origin.channels() != 1) {
         cv::cvtColor(img_origin, gray_img, cv::COLOR_RGB2GRAY);
@@ -333,22 +333,63 @@ cv::Mat processImg2(const cv::Mat& img_origin, int is_right, bool have_laser) {
         gray_img = img_origin.clone();
     }
 
-    // 2. 中值滤波，去除反光和斑点噪声，保护边缘
-    cv::Mat denoised_img;
-    cv::medianBlur(gray_img, denoised_img, 5); // 5x5核，强力去除小噪声
+    // 降采样到原图1/2
+    cv::Mat resized_img;
+    cv::resize(gray_img, resized_img, cv::Size(), 0.5, 0.5, cv::INTER_LINEAR);
 
-    // 3. 自适应阈值，增强激光线结构
+    cv::Mat denoised_img;
+    cv::medianBlur(resized_img, denoised_img, 3);
+
     cv::Mat binary_img;
     cv::adaptiveThreshold(denoised_img, binary_img, 255,
                          cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY,
-                         41, -13); // 31为窗口，17为偏置，可根据实际调整
+                         21, -11); // 相应调整窗口大小
 
-    // 4. 形态学开运算，去除小噪声，保护细线
-    int morph_size = std::min(binary_img.rows, binary_img.cols) > 2000 ? 3 : 1;
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(morph_size, morph_size));
-    cv::morphologyEx(binary_img, binary_img, cv::MORPH_OPEN, kernel);
+    // 形态学操作
+    // cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+    // cv::morphologyEx(binary_img, binary_img, cv::MORPH_OPEN, kernel);
 
-    // 5. 返回处理结果
+    // 上采样回去
+    cv::resize(binary_img, binary_img, gray_img.size(), 0, 0, cv::INTER_NEAREST);
+
+    return binary_img;
+}
+
+cv::Mat processImg3(const cv::Mat& img_origin, int is_right, bool have_laser) {
+    CV_Assert(!img_origin.empty());
+
+    // 1) 灰度（避免不必要 clone）
+    cv::Mat gray_img;
+    if (img_origin.channels() != 1) {
+        cv::cvtColor(img_origin, gray_img, cv::COLOR_RGB2GRAY);
+    } else {
+        // 直接引用输入数据，不拷贝
+        gray_img = img_origin;
+    }
+
+    // 降采样到原图1/2
+    cv::Mat resized_img;
+    cv::resize(gray_img, resized_img, cv::Size(), 0.5, 0.5, cv::INTER_LINEAR);
+
+    cv::Mat bright_mask;
+    cv::threshold(resized_img, bright_mask, 65, 255, cv::THRESH_TOZERO);
+
+    // 2) 中值去噪（保留边缘）
+    cv::Mat denoised_img;
+    cv::medianBlur(bright_mask, denoised_img, 3);
+
+    // 3) 一次 GaussianBlur + 比较
+    cv::Mat local_mean;
+    cv::GaussianBlur(denoised_img, local_mean, cv::Size(15, 15), 0, 0, cv::BORDER_REPLICATE);
+    const int C_param = -17;
+    int C_eff = -C_param;
+    cv::Mat binary_img;
+    cv::compare(denoised_img, local_mean + C_eff, binary_img, cv::CMP_GT);
+    if (binary_img.type() != CV_8U) binary_img.convertTo(binary_img, CV_8U);
+
+    // 上采样回去
+    cv::resize(binary_img, binary_img, gray_img.size(), 0, 0, cv::INTER_NEAREST);
+
     return binary_img;
 }
 

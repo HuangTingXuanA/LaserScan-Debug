@@ -7,8 +7,8 @@
 
 int main() {
 
-    // loadImgs();
-    loadTrackImgs();
+    loadImgs();
+    // loadTrackImgs();
 
     bool is_load = loadStereoCalibInfo();
     if (!is_load) throw std::logic_error("can't load stereo calib info");
@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        // if (img_idx <= 2) continue;
+        // if (img_idx != 9) continue;
         printf("idx: %d\n", (int)img_idx);
         
         //  极线校正
@@ -28,21 +28,26 @@ int main() {
             img_l,
             img_r
         );
-        calib_info = ConfigManager::getInstance().getCalibInfo();
 
         cv::Mat orig_l, orig_r;
         orig_l = rectify_imgs_have_laser[0].clone();
         orig_r = rectify_imgs_have_laser[1].clone();
+
+        auto t0 = std::chrono::high_resolution_clock::now();
 
         // 预处理图像
         cv::Mat bin_img_l, bin_img_r;
         bin_img_l = processImg2(rectify_imgs_have_laser[0], 0, true);
         bin_img_r = processImg2(rectify_imgs_have_laser[1], 1, true);
 
+        auto t1 = std::chrono::high_resolution_clock::now();
+        float duration_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        std::cout << "preprocess time: " << duration_ms << " ms" << std::endl;
+
         // 生成连通区域和二值化图
         std::vector<std::vector<std::pair<cv::Point, cv::Point>>> contours_l, contours_r;
-        Two_PassNew3(bin_img_l, contours_l, img_idx);
-        Two_PassNew3(bin_img_r, contours_r, img_idx);
+        Two_PassNew4(bin_img_l, contours_l, img_idx);
+        Two_PassNew4(bin_img_r, contours_r, img_idx);
 
         // 只保留激光区域的原始像素
         cv::Mat laser_img_l = cv::Mat::zeros(rectify_imgs_have_laser[0].size(), CV_8UC1);
@@ -52,11 +57,11 @@ int main() {
 
         // 激光线中心点提取
         LaserProcessor laser_processor;
-        auto laser_l = laser_processor.extractLine3(laser_img_l, contours_l, img_idx);
-        auto laser_r = laser_processor.extractLine3(laser_img_r, contours_r, img_idx);
+        auto laser_l = laser_processor.extractLine2(laser_img_l, contours_l, img_idx);
+        auto laser_r = laser_processor.extractLine2(laser_img_r, contours_r, img_idx);
         cv::Mat vis_img_l = rectify_imgs_have_laser[0].clone();
         cv::Mat vis_img_r = rectify_imgs_have_laser[1].clone();
-        int scale = 10;
+        int scale = 1;
         cv::Size new_size_l(vis_img_l.cols * scale, vis_img_l.rows * scale);
         cv::Size new_size_r(vis_img_r.cols * scale, vis_img_r.rows * scale);
         // 按指定尺寸缩放
@@ -70,8 +75,8 @@ int main() {
         for (const auto& l : laser_r)
             for (const auto& [y, p] : l.points)
                 vis_img_r.at<cv::Vec3b>(static_cast<int>(y * scale), static_cast<int>(p.x * scale)) = cv::Vec3b(255, 0, 255);
-        cv::imwrite(debug_img_dir / ("laser_img_l" + std::to_string(img_idx) + ".bmp"), vis_img_l);
-        cv::imwrite(debug_img_dir / ("laser_img_r" + std::to_string(img_idx) + ".bmp"), vis_img_r);
+        // cv::imwrite(debug_img_dir / ("laser_img_l" + std::to_string(img_idx) + ".bmp"), vis_img_l);
+        // cv::imwrite(debug_img_dir / ("laser_img_r" + std::to_string(img_idx) + ".bmp"), vis_img_r);
 
         // 左线均匀采样
         std::vector<std::map<float, float>> sample_points_l(laser_l.size());
@@ -114,20 +119,20 @@ int main() {
         }
 
         // 重投影到右图（l_idx, plane_idx, r_idx）
-        // auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        // auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);;
 
-        // 同名点匹配
-        // auto cloud_points = laser_processor.generateCloudPoints(match_vec_tuple, laser_l, laser_r);
 
-        auto match_res = laser_processor.match5(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        auto match_res = laser_processor.match8(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
         auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
+        for (const auto& m_res : match_res)
+            printf("L%d - R%d - P%d - S%.3f\n", m_res.l_idx, m_res.r_idx, m_res.p_idx, m_res.score);
 
-        std::string txt_file = std::to_string(img_idx) + ".txt";
-        std::ofstream ofs(output_dir_ / txt_file);
-        for (const auto& pt : cloud_points) {
-            ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
-        }
-        ofs.close();
+        // std::string txt_file = std::to_string(img_idx) + ".txt";
+        // std::ofstream ofs(output_dir_ / txt_file);
+        // for (const auto& pt : cloud_points) {
+        //     ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
+        // }
+        // ofs.close();
     }
 
     return 0;
