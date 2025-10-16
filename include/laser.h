@@ -114,6 +114,12 @@ public:
         const std::vector<LaserLine>& right_lines,
         const std::vector<QuadSurface>& surfaces,
         const CalibrationResult& calib);
+    
+    // 区间冲突检测：检查两个区间集合是否有重叠
+    bool hasIntervalConflict(const std::vector<Interval>& intervals1, const std::vector<Interval>& intervals2);
+    
+    // 全局贪心匹配：支持一对多匹配（区间不重叠）
+    std::vector<IntervalMatch> globalGreedyMatching(const std::vector<IntervalMatch>& candidates);
     std::vector<IntervalMatch> match9(
         const std::vector<LaserLine>& laser_l,
         const std::vector<LaserLine>& laser_r,
@@ -142,8 +148,8 @@ public:
 
 private:
     const float roi_scale_ = 1.05f;
-    const float D_thresh_ = 20.0f;
-    const float S_thresh_ = 3.5f;
+    const float D_thresh_ = 10.0f;
+    const float S_thresh_ = 3.3f;
     const int MIN_LEN_ = 80;
     const float EPS_ = 1e-4f;
     const float precision_ = 0.5f;

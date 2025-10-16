@@ -18,7 +18,7 @@ int main() {
     auto calib_info = ConfigManager::getInstance().getCalibInfo();
 
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        if (img_idx != 24) continue;
+        // if (img_idx < 24) continue;
         printf("idx: %d\n", (int)img_idx);
         
         //  极线校正
@@ -125,10 +125,10 @@ int main() {
         // auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);;
 
 
-        auto match_res = laser_processor.match8(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        auto match_res = laser_processor.match9(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
         auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
-        for (const auto& m_res : match_res)
-            printf("L%d - R%d - P%d - S: %.3f\n", m_res.l_idx, m_res.r_idx, m_res.p_idx, m_res.score);
+        // for (const auto& m_res : match_res)
+        //     printf("L%d - R%d - P%d - S: %.3f\n", m_res.l_idx, m_res.r_idx, m_res.p_idx, m_res.score);
 
         // std::string txt_file = std::to_string(img_idx) + ".txt";
         // std::ofstream ofs(output_dir_ / txt_file);
