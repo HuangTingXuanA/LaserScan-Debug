@@ -13,6 +13,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 find_package(OpenCV REQUIRED)
 find_package(TBB REQUIRED)
 find_package(CUDAToolkit REQUIRED)
+find_package(fmt REQUIRED)
 
 # 3. 源文件
 file(GLOB_RECURSE CPP_SRCS src/**.cpp )
@@ -35,6 +36,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     cublas
     cusolver
     curand
+    fmt::fmt
 )
 
 # 6. CUDA 目标属性

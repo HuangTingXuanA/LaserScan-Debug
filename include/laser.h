@@ -17,6 +17,13 @@ struct Center {
     cv::Vec2f dir;  // 局部方向，必须保证 dir[1] != 0
 };
 
+struct ScoreComponents {
+  float median_distance;
+  float mad;
+  float overlap_ratio;
+  float tail_penalty;
+  float score = FLT_MAX;
+};
 struct Interval { float y_start, y_end; int count;};
 struct IntervalMatch {
     int l_idx, p_idx, r_idx;
@@ -72,6 +79,12 @@ public:
     float computeCompScore(float avgDist, float coverage, float wD = 0.6f, float wC = 0.4f);
     float computeEnhancedScore(const std::vector<std::pair<float, float>>& distance_pairs,
         int left_line_total_points, float& coverage, float& std_dev);
+    // 新的"以短为基"评分函数
+    float computeShortBasedScore(
+        const std::vector<std::pair<float, float>>& distance_pairs,
+        int left_point_count, int right_point_count,
+        float& coverage, float& std_dev);
+        
     float computeEnhancedScoreV2(
         const std::vector<std::pair<float, float>>& distance_pairs,
         int left_point_count, int right_point_count,
@@ -108,6 +121,13 @@ public:
         const cv::Mat& rectify_r
     );
 
+    std::vector<IntervalMatch> match10(
+        const std::vector<LaserLine>& laser_l,
+        const std::vector<LaserLine>& laser_r,
+        const cv::Mat& rectify_l,
+        const cv::Mat& rectify_r
+    );
+
     void removeMatchedIntervals(LaserLine& line, const std::vector<Interval>& matched_intervals);
     std::vector<IntervalMatch> generateCandidatesForRemaining(
         const std::vector<LaserLine>& left_lines,
@@ -120,6 +140,9 @@ public:
     
     // 全局贪心匹配：支持一对多匹配（区间不重叠）
     std::vector<IntervalMatch> globalGreedyMatching(const std::vector<IntervalMatch>& candidates);
+    
+    // 自适应阈值计算：基于匹配点数和重叠比的动态阈值
+    float computeAdaptiveThreshold(int matched_count, float overlap_ratio, float base_threshold);
     std::vector<IntervalMatch> match9(
         const std::vector<LaserLine>& laser_l,
         const std::vector<LaserLine>& laser_r,
@@ -148,9 +171,9 @@ public:
 
 private:
     const float roi_scale_ = 1.05f;
-    const float D_thresh_ = 10.0f;
-    const float S_thresh_ = 3.3f;
-    const int MIN_LEN_ = 80;
+    const float D_thresh_ = 30.0f;
+    const float S_thresh_ = 3.5f;
+    const int MIN_LEN_ = 160;
     const float EPS_ = 1e-4f;
     const float precision_ = 0.5f;
     const float N_HIGH = 1100.0f;

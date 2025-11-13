@@ -1,8 +1,10 @@
 #include "main.h"
 #include "twopass.h"
 #include "laser.h"
+#include "match.h"
 #include <iostream>
 #include <fstream>
+#include <vector>
 
 
 int main() {
@@ -15,10 +17,10 @@ int main() {
     is_load = loadQuadSurfaceInfo();
     if (!is_load) throw std::logic_error("can't load planes calib info");
 
-    auto calib_info = ConfigManager::getInstance().getCalibInfo();
-
     for (size_t img_idx = 0; img_idx < laser_imgs_.size(); ++img_idx) {
-        // if (img_idx < 24) continue;
+        std::set<size_t> problem_idx_set = {1, 6, 7, 9, 23, 33, 34, 35, 42, 46};
+        if (problem_idx_set.find(img_idx) == problem_idx_set.end()) continue;
+
         printf("idx: %d\n", (int)img_idx);
         
         //  极线校正
@@ -122,11 +124,11 @@ int main() {
         }
 
         // 重投影到右图（l_idx, plane_idx, r_idx）
-        // auto match_vec_tuple = laser_processor.match4(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);;
+        // auto match_vec_tuple = laser_processor.match5(sample_points_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);;
 
 
-        auto match_res = laser_processor.match9(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
-        auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
+        // auto match_res = laser_processor.match10(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+        // auto cloud_points = laser_processor.generateCloudPoints2(match_res, laser_l, laser_r);
         // for (const auto& m_res : match_res)
         //     printf("L%d - R%d - P%d - S: %.3f\n", m_res.l_idx, m_res.r_idx, m_res.p_idx, m_res.score);
 
@@ -136,6 +138,11 @@ int main() {
         //     ofs << pt.x << " " << pt.y << " " << pt.z << "\n";
         // }
         // ofs.close();
+
+        //-------------------------------------------------------------------------------
+        MatchProcessor match_processor;
+        match_processor.match(laser_l, laser_r, rectify_imgs_have_laser[0], rectify_imgs_have_laser[1]);
+
     }
 
     return 0;

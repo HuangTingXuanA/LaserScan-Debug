@@ -1042,16 +1042,28 @@ float LaserProcessor::findSymmetricCenter4(const cv::Mat &img, float x, float y,
 
   float extend_range = R;
 
-  // 1. 全范围采样
+  // 预分配内存
+  size_t expected_size = static_cast<size_t>((extend_range + 2.0f) / step) + 1;
   std::vector<float> Ts, Vs;
+  Ts.reserve(expected_size);
+  Vs.reserve(expected_size);
+
+  // 全范围采样
   for (float t = -2.0f; t <= extend_range; t += step) {
-    float val = img.at<float>(y + t * dir[1], x + t * dir[0]);
-    Ts.push_back(t);
-    Vs.push_back(val);
+      float x_t = x + t * dir[0];
+      float y_t = y + t * dir[1];
+      
+      int x_round = std::round(x_t);
+      int y_round = std::round(y_t);
+
+      if (x_round < 0 || x_round > img.cols || y_round < 0 || y_round > img.rows) continue;
+
+      float val = img.at<float>(y_t, x_t);
+      Ts.push_back(t);
+      Vs.push_back(val);
   }
   int N = (int)Ts.size();
-  if (N < 3)
-    return FLT_MAX;
+  if (N < 3) return FLT_MAX;
 
   // 2. 找到第一个峰值
   float maxVal = -FLT_MAX;
@@ -1564,17 +1576,17 @@ std::vector<LaserLine> LaserProcessor::extractLine2(
     cv::Point2f axis = p2 - p1;
     float axis_len = cv::norm(axis);
     cv::Point2f axis_dir = axis / axis_len;
-    float min_proj = 0.05f * axis_len;
-    float max_proj = 0.95f * axis_len;
+    float min_proj = 0.03f * axis_len;
+    float max_proj = 0.97f * axis_len;
 
     // 3. 激光线中心点提取
     std::map<float, float> orign_centers;
     float max_search_range = -FLT_MAX;
     for (const auto &p : edge_pair) {
-      cv::Point2f vec = cv::Point2f(p.first.x, p.first.y) - p1;
-      float proj = vec.dot(axis_dir);
-      if (proj <= min_proj || proj >= max_proj)
-        continue;
+      // cv::Point2f vec = cv::Point2f(p.first.x, p.first.y) - p1;
+      // float proj = vec.dot(axis_dir);
+      // if (proj <= min_proj || proj >= max_proj)
+      //   continue;
 
       float search_range = (p.second.x - p.first.x + 1);
       cv::Vec2f dir(1, 0);
@@ -1603,14 +1615,15 @@ std::vector<LaserLine> LaserProcessor::extractLine2(
     if (orign_centers.empty())
       continue;
 
+    // 4. 同一条线相邻中心点插值为整数
+    std::vector<cv::Point2f> new_centers = processCenters(orign_centers);
+
     // debug查看原始中心点分布
-    for (const auto &[y, x] : orign_centers)
+    for (const auto &[x, y] : new_centers)
       orign_centers_vis.at<cv::Vec3b>(static_cast<int>(y * scale),
                                       static_cast<int>(x * scale)) =
           cv::Vec3b(255, 0, 255);
 
-    // 4. 同一条线相邻中心点插值为整数
-    std::vector<cv::Point2f> new_centers = processCenters(orign_centers);
 
     // 5. 存储结果
     // const float laser_width = max_search_range;
@@ -2020,6 +2033,126 @@ float LaserProcessor::computeEnhancedScore(
   return score;
 }
 
+// 新的"以短为基"评分函数
+float LaserProcessor::computeShortBasedScore(
+    const std::vector<std::pair<float, float>> &distance_pairs,
+    int left_point_count, int right_point_count, float &coverage,
+    float &std_dev) {
+
+  if (distance_pairs.empty())
+    return FLT_MAX;
+
+  // =============== 核心设计：输入数据和参数都基于"以短为基"原则 ===============
+  
+  // 1. 确定较短线段作为基准（现在传入的参数已经是有效点数）
+  int shorter_length = std::min(left_point_count, right_point_count);
+  int longer_length = std::max(left_point_count, right_point_count);
+  
+  // 边界保护：避免极短线段
+  const int MIN_SEGMENT_LENGTH = 10;
+  if (shorter_length < MIN_SEGMENT_LENGTH) {
+    return FLT_MAX;
+  }
+  
+  int matched_count = static_cast<int>(distance_pairs.size());
+  
+  // 2. 核心指标：区间重叠比（基于较短线段）
+  float overlap_ratio = static_cast<float>(matched_count) / static_cast<float>(shorter_length);
+  overlap_ratio = std::min(overlap_ratio, 1.0f); // 防止超过1.0
+  
+  // 3. 几何精度项：使用众数距离（反映主要匹配质量）
+  std::vector<float> distances;
+  distances.reserve(distance_pairs.size());
+  float sum_distance = 0.0f;
+  for (const auto &[y, d] : distance_pairs) {
+    distances.push_back(d);
+    sum_distance += d;
+  }
+  
+  // 计算众数距离（几何精度）- 反映最常见的匹配质量
+  float mode_distance = 0.0f;
+  if (!distances.empty()) {
+    // 使用分箱方法计算众数
+    const float bin_width = 0.15f; // 0.15像素的分箱宽度
+    std::map<int, int> histogram;
+    
+    // 构建直方图
+    for (float d : distances) {
+      int bin = static_cast<int>(std::round(d / bin_width));
+      histogram[bin]++;
+    }
+    
+    // 找到频次最高的分箱
+    int max_count = 0;
+    int mode_bin = 0;
+    for (const auto &[bin, count] : histogram) {
+      if (count > max_count) {
+        max_count = count;
+        mode_bin = bin;
+      }
+    }
+    
+    // 计算众数值（分箱中心）
+    mode_distance = mode_bin * bin_width;
+    
+    // 如果众数频次太低（<20%），回退到中位数
+    if (max_count < static_cast<int>(distances.size() * 0.2)) {
+      std::nth_element(distances.begin(), distances.begin() + distances.size() / 2,
+                       distances.end());
+      mode_distance = distances[distances.size() / 2];
+    }
+  }
+  
+  // 同时计算平均距离用于标准差计算
+  float mean_distance = sum_distance / distances.size();
+  
+  // 4. 几何一致性项：基于平均距离计算标准差
+  float variance = 0.0f;
+  for (float d : distances) {
+    float diff = d - mean_distance;
+    variance += diff * diff;
+  }
+  variance /= distances.size();
+  std_dev = std::sqrt(variance);
+  
+  // 5. 尾段惩罚项：长度差异的轻微惩罚
+  float length_diff_ratio = static_cast<float>(longer_length - shorter_length) / 
+                           static_cast<float>(longer_length);
+  float tail_penalty = length_diff_ratio;
+  
+  // 6. 输出兼容性参数
+  coverage = overlap_ratio; // 基于短线段的重叠比
+  
+  // =============== 新评分函数 ===============
+  // 权重设计：重叠质量为主要项，几何指标为辅助项
+  const float alpha = 0.3f;  // 几何精度权重
+  const float beta = 0.4f;   // 几何一致性权重
+  const float gamma = 0.2f;  // 重叠质量权重
+  const float delta = 0.1f;  // 尾段惩罚权重
+  
+  // 重叠质量项：overlap_ratio越高越好，转换为惩罚项
+  float overlap_penalty = std::max(0.0f, 1.0f - overlap_ratio);
+  
+  // 重叠质量阈值惩罚：overlap_ratio < 0.3时给予额外惩罚
+  float low_overlap_penalty = (overlap_ratio < 0.3f) ? (0.3f - overlap_ratio) * 10.0f : 0.0f;
+  
+  float score = alpha * mode_distance +             // 几何精度项（使用众数距离）
+                beta * std_dev +                        // 几何一致性项
+                gamma * overlap_penalty +           // 重叠质量项（主要）
+                gamma * low_overlap_penalty +       // 低重叠额外惩罚
+                delta * tail_penalty;               // 尾段惩罚项（辅助）
+
+  // ScoreComponents components;
+  // components.median_distance = median_distance;
+  // components.mad = mad;
+  // components.overlap_ratio = overlap_ratio;
+  // components.tail_penalty = tail_penalty;
+  // components.score = score;
+
+  return score;
+}
+
+// 保持向后兼容性
 float LaserProcessor::computeEnhancedScoreV2(
     const std::vector<std::pair<float, float>> &distance_pairs,
     int left_point_count, int right_point_count, float &coverage,
@@ -2200,6 +2333,7 @@ LaserProcessor::match4(const std::vector<std::map<float, float>> &sample_points,
                 cv::Point2f(l_mid_it->second, l_mid_it->first),
                 cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0), 2);
 #endif
+
     // 按 plane_idx 提取最佳候选
     std::map<int, MatchCandidate> bestOfPlane;
     for (auto &m : allCands[l]) {
@@ -2290,7 +2424,8 @@ LaserProcessor::match4(const std::vector<std::map<float, float>> &sample_points,
     cv::imshow("vis_img", vis);
     cv::waitKey(0);
 #endif
-  }
+  
+}
 
   // 多轮严格锁定
   bool prog = true;
@@ -2527,14 +2662,9 @@ LaserProcessor::match5(const std::vector<std::map<float, float>> &sample_points,
   double cx_r = calib.P[1].at<double>(0, 2), cy_r = calib.P[1].at<double>(1, 2);
   double baseline = -calib.P[1].at<double>(0, 3) / fx_r;
 
-  constexpr float D_thresh_ = 20.0f;
-  constexpr float S_thresh_ = 20.0f;
-  constexpr float Delta_thresh = 3.0f;
-  constexpr int MIN_LEN_ =
-      80; // 存在问题：大一些会过滤掉正确导致匹配错误，小一些容易配错
-
   int L = (int)sample_points.size();
   int R = (int)laser_r.size();
+  const float S_thresh = 30.0f;
 
   // 结果与锁定区间
   std::vector<IntervalMatch> final_matches;
@@ -2590,8 +2720,8 @@ LaserProcessor::match5(const std::vector<std::map<float, float>> &sample_points,
         const auto &coef = planes[p].coefficients;
         std::map<int, std::vector<std::pair<float, float>>>
             support; // r_idx->(y,distance)
-        // if (l == 5 && p == 1)
-        //     puts("");
+        // if (l == 9 && p == 5)
+            // puts("");
         for (auto [y_f, x_f] : pts) {
           // 左侧已锁区跳过
           bool skipL = false;
@@ -2603,22 +2733,24 @@ LaserProcessor::match5(const std::vector<std::map<float, float>> &sample_points,
           }
           if (skipL)
             continue;
+            
           // 重投影
           cv::Point3f ray((x_f - cx_l) / fx_l, (y_f - cy_l) / fy_l, 1.0f);
           ray *= 1.0f / cv::norm(ray);
           auto ips = findIntersection({0, 0, 0}, ray, coef);
-          if (ips.empty())
-            continue;
+          if (ips.empty()) continue;
+
           cv::Point3f pt3;
           bool ok = false;
-          for (auto &q : ips)
+          for (auto &q : ips) {
             if (q.z > 100 && q.z < 1500) {
               pt3 = q;
               ok = true;
               break;
             }
-          if (!ok)
-            continue;
+          }
+          if (!ok) continue;
+
           cv::Point3f pr(pt3.x - baseline, pt3.y, pt3.z);
           float xr = fx_r * pr.x / pr.z + cx_r;
           float yr = alignToPrecision(fy_r * pr.y / pr.z + cy_r);
@@ -2702,7 +2834,7 @@ LaserProcessor::match5(const std::vector<std::map<float, float>> &sample_points,
           // 统一打分
           float score =
               computeEnhancedScore(allpd, repro_cnt, coverage, std_dev);
-          if (score <= S_thresh_) {
+          if (score <= S_thresh) {
             cands.push_back({l, p, ent.first, segs, score, coverage, std_dev});
           }
         }
@@ -2754,79 +2886,87 @@ LaserProcessor::match5(const std::vector<std::map<float, float>> &sample_points,
       // 过程可视化
 #ifdef DEBUG_PLANE_MATCH
       cv::Mat vis = vis_global.clone();
-      // 左图激光点
-      for (auto [y, x] : pts)
-        cv::circle(vis, cv::Point2f(x, y), 1.5, {0, 255, 0}, -1);
-      // 左线ID
+      const int k_scale = 1;
+      cv::Mat big_vis;
+      cv::resize(vis, big_vis, cv::Size(), k_scale, k_scale, cv::INTER_NEAREST);
+      
+      // 左图激光点（用像素操作代替circle）
+      for (auto [y_f, x_f] : pts) {
+          int x = static_cast<int>(x_f * k_scale);
+          int y = static_cast<int>(y_f * k_scale);
+          if (x >= 0 && x < big_vis.cols && y >= 0 && y < big_vis.rows) {
+              big_vis.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 255, 0); // 绿色
+          }
+      }
+      
+      // 左线ID（位置需要缩放）
       auto l_mid = pts.begin();
       std::advance(l_mid, pts.size() / 2);
-      cv::putText(vis, "L" + std::to_string(l),
-                  cv::Point2f(l_mid->second, l_mid->first),
+      cv::putText(big_vis, "L" + std::to_string(l),
+                  cv::Point2f(l_mid->second * k_scale, l_mid->first * k_scale),
                   cv::FONT_HERSHEY_SIMPLEX, 1.3, {0, 255, 0}, 2);
+      
       // 重投影点（红）及候选区间（黄）
-      cv::Point2i test_point(10, 40);
+      cv::Point2i test_point(10 * k_scale, 40 * k_scale); // 缩放文本位置
       for (auto &c : cands) {
-        // 蓝色整条右线
-        for (auto &p_r : laser_r[c.r_idx].points)
-          cv::circle(vis, cv::Point2f(p_r.second.x + off, p_r.second.y), 1.5,
-                     r_laser_col, -1);
-        // 红色投影
-        const auto &coef_c = planes[c.p_idx].coefficients;
-        for (auto [y_f, x_f] : pts) {
-          cv::Point3f ray((x_f - cx_l) / fx_l, (y_f - cy_l) / fy_l, 1.0f);
-          ray *= 1.0f / cv::norm(ray);
-          auto ips = findIntersection({0, 0, 0}, ray, coef_c);
-          if (ips.empty())
-            continue;
-          cv::Point3f pt3;
-          bool ok = false;
-          for (auto &q : ips)
-            if (q.z > 100 && q.z < 1200) {
-              pt3 = q;
-              ok = true;
-              break;
-            }
-          if (!ok)
-            continue;
-          cv::Point3f pr(pt3.x - baseline, pt3.y, pt3.z);
-          float xr = fx_r * pr.x / pr.z + cx_r;
-          float yr = alignToPrecision(fy_r * pr.y / pr.z + cy_r);
-          if (xr >= 0 && xr < rectify_r.cols && yr >= 0 && yr < rectify_r.rows)
-            cv::circle(vis, cv::Point2f(xr + off, yr), 1.5, {0, 0, 255}, -1);
-        }
-        // 黄色区间
-        for (auto &iv : c.intervals)
-          for (float y0 = iv.y_start; y0 <= iv.y_end; y0 += precision_) {
-            auto it_r = laser_r[c.r_idx].points.lower_bound(y0);
-            if (it_r != laser_r[c.r_idx].points.begin()) {
-              auto prev = std::prev(it_r);
-              if (it_r == laser_r[c.r_idx].points.end() ||
-                  fabs(prev->first - y0) < fabs(it_r->first - y0)) {
-                it_r = prev;
+          // 蓝色整条右线（用像素操作）
+          for (auto &p_r : laser_r[c.r_idx].points) {
+              int x = static_cast<int>((p_r.second.x + off) * k_scale);
+              int y = static_cast<int>(p_r.second.y * k_scale);
+              if (x >= 0 && x < big_vis.cols && y >= 0 && y < big_vis.rows) {
+                  big_vis.at<cv::Vec3b>(y, x) = cv::Vec3b(r_laser_col[0], r_laser_col[1], r_laser_col[2]);
               }
-            }
-            if (fabs(it_r->first - y0) > EPS_)
-              continue;
-            cv::circle(vis, cv::Point2f(it_r->second.x + off, y0), 1.5,
-                       proc_interval_col, -1);
           }
-        // 右线ID
-        auto r_mid = laser_r[c.r_idx].points.begin();
-        std::advance(r_mid, laser_r[c.r_idx].points.size() / 2);
-        cv::putText(vis, "R" + std::to_string(c.r_idx),
-                    cv::Point2f(r_mid->second.x + off, r_mid->second.y),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.3, {0, 255, 0}, 2);
-        // 文本：候选数
-        char text_buf[128];
-        snprintf(text_buf, sizeof(text_buf),
-                 "L%d->P%d->R%d (S %.2f / C %.2f%%)", c.l_idx, c.p_idx, c.r_idx,
-                 c.score, c.coverage * 100);
-        cv::putText(vis, text_buf, test_point, cv::FONT_HERSHEY_SIMPLEX, 1.2,
-                    {0, 255, 255}, 2);
-        test_point.y += 45;
+          
+          // 红色投影点（用像素操作）
+          const auto &coef_c = planes[c.p_idx].coefficients;
+          for (auto [y_f, x_f] : pts) {
+              cv::Point3f ray((x_f - cx_l) / fx_l, (y_f - cy_l) / fy_l, 1.0f);
+              ray *= 1.0f / cv::norm(ray);
+              auto ips = findIntersection({0, 0, 0}, ray, coef_c);
+              if (ips.empty())
+                continue;
+              cv::Point3f pt3;
+              bool ok = false;
+              for (auto &q : ips)
+                if (q.z > 100 && q.z < 1200) {
+                  pt3 = q;
+                  ok = true;
+                  break;
+                }
+              if (!ok)
+                continue;
+              cv::Point3f pr(pt3.x - baseline, pt3.y, pt3.z);
+              float xr = fx_r * pr.x / pr.z + cx_r;
+              float yr = alignToPrecision(fy_r * pr.y / pr.z + cy_r);
+              if (xr >= 0 && xr < rectify_r.cols && yr >= 0 && yr < rectify_r.rows) {
+                  int x = static_cast<int>((xr + off) * k_scale);
+                  int y = static_cast<int>(yr * k_scale);
+                  if (x >= 0 && x < big_vis.cols && y >= 0 && y < big_vis.rows) {
+                      big_vis.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 0, 255); // 红色
+                  }
+              }
+          }
+          
+          // 右线ID（位置需要缩放）
+          auto r_mid = laser_r[c.r_idx].points.begin();
+          std::advance(r_mid, laser_r[c.r_idx].points.size() / 2);
+          cv::putText(big_vis, "R" + std::to_string(c.r_idx),
+                      cv::Point2f((r_mid->second.x + off) * k_scale, r_mid->second.y * k_scale),
+                      cv::FONT_HERSHEY_SIMPLEX, 1.3, {0, 255, 0}, 2);
+          
+          // 文本：候选数（位置已缩放）
+          char text_buf[128];
+          snprintf(text_buf, sizeof(text_buf),
+                  "L%d->P%d->R%d (S %.2f / C %.2f%%)", c.l_idx, c.p_idx, c.r_idx,
+                  c.score, c.coverage * 100);
+          cv::putText(big_vis, text_buf, test_point, cv::FONT_HERSHEY_SIMPLEX, 1.2,
+                      {0, 255, 255}, 2);
+          test_point.y += 45 * k_scale;  // 增加行距
       }
-      cv::imshow("vis_img", vis);
+      cv::imshow("vis_img", big_vis);
       cv::waitKey(0);
+      // if (l == 9) cv::imwrite("debug_img/match_debug_l9.jpg", big_vis);
 #endif
     }
   }
@@ -2905,16 +3045,6 @@ LaserProcessor::match6(const std::vector<std::map<float, float>>
   double fx_r = calib.P[1].at<double>(0, 0), fy_r = calib.P[1].at<double>(1, 1);
   double cx_r = calib.P[1].at<double>(0, 2), cy_r = calib.P[1].at<double>(1, 2);
   double baseline = -calib.P[1].at<double>(0, 3) / fx_r;
-
-  // 阈值（你可以按需调整）
-  constexpr float D_thresh_ = 20.0f;
-  constexpr float S_thresh_ = 20.0f;
-  constexpr float Delta_thresh = 3.0f;
-  constexpr int MIN_LEN_ = 80;
-
-  // 容差与插值精度（可按工程设定修改）
-  const float EPS_ = 1e-4f;
-  const float precision_ = 1.0f;
 
   // 结构尺寸
   const int L = static_cast<int>(sample_points.size());
@@ -3686,814 +3816,7 @@ LaserProcessor::match7(const std::vector<LaserLine> &laser_l,
 /***************************************************************************************
  */
 
-/************************************* MatchV8
- * *************************************** */
-
-std::vector<IntervalMatch>
-LaserProcessor::match8(const std::vector<LaserLine> &laser_l,
-                       const std::vector<LaserLine> &laser_r,
-                       const cv::Mat &rectify_l, const cv::Mat &rectify_r) {
-  const int img_rows = rectify_l.rows;
-  const int img_cols = rectify_l.cols;
-  const int L = static_cast<int>(laser_l.size());
-  const int R = static_cast<int>(laser_r.size());
-
-  const auto calib = ConfigManager::getInstance().getCalibInfo();
-  const auto surfaces = ConfigManager::getInstance().getQuadSurfaces();
-  const int P = static_cast<int>(surfaces.size());
-
-  // 相机内参
-  double fx_l = calib.P[0].at<double>(0, 0), fy_l = calib.P[0].at<double>(1, 1);
-  double cx_l = calib.P[0].at<double>(0, 2), cy_l = calib.P[0].at<double>(1, 2);
-  double fx_r = calib.P[1].at<double>(0, 0), fy_r = calib.P[1].at<double>(1, 1);
-  double cx_r = calib.P[1].at<double>(0, 2), cy_r = calib.P[1].at<double>(1, 2);
-  double baseline = -calib.P[1].at<double>(0, 3) / fx_r;
-
-  // =============== 阶段1：自适应预处理 ===============
-
-  // 1.1 高质量匹配阈值设定
-  const int HIGH_QUALITY_POINT_THRESH = 1000;   // 高质量线的点数阈值
-  const float HIGH_QUALITY_SCORE_THRESH = 2.3f; // 高质量线的得分阈值
-
-  // 1.2 预处理右线数据
-  std::vector<std::vector<std::pair<float, LaserPoint>>> right_vec(R);
-  for (int r = 0; r < R; ++r) {
-    right_vec[r].reserve(laser_r[r].points.size());
-    for (const auto &kv : laser_r[r].points) {
-      right_vec[r].emplace_back(kv.first, kv.second);
-    }
-  }
-
-  // 1.3 预计算左线采样数据
-  struct LeftSample {
-    std::vector<float> ys, xs;
-    std::vector<cv::Point3f> rays;
-    int original_point_count;
-  };
-  std::vector<LeftSample> left_samples(L);
-  for (int l = 0; l < L; ++l) {
-    const auto &mp = laser_l[l].points;
-    auto &ls = left_samples[l];
-    ls.original_point_count = static_cast<int>(mp.size());
-    ls.ys.reserve(mp.size());
-    ls.xs.reserve(mp.size());
-    ls.rays.reserve(mp.size());
-
-    for (const auto &kv : mp) {
-      float y_f = kv.first;
-      float x_f = kv.second.x;
-      ls.ys.push_back(y_f);
-      ls.xs.push_back(x_f);
-      cv::Point3f ray(
-          (x_f - static_cast<float>(cx_l)) / static_cast<float>(fx_l),
-          (y_f - static_cast<float>(cy_l)) / static_cast<float>(fy_l), 1.0f);
-      float rn = std::sqrt(ray.x * ray.x + ray.y * ray.y + ray.z * ray.z);
-      if (rn > 0.0f)
-        ray *= (1.0f / rn);
-      ls.rays.push_back(ray);
-    }
-  }
-
-#ifdef DEBUG_PLANE_MATCH_FINAL
-  // 全局可视化底图
-  cv::Mat vis_global;
-  cv::hconcat(rectify_l, rectify_r, vis_global);
-  if (vis_global.channels() == 1)
-    cv::cvtColor(vis_global, vis_global, cv::COLOR_GRAY2BGR);
-  int off = rectify_l.cols;
-  static const cv::Scalar proc_interval_col(0, 255, 255); // 候选区间颜色
-  static const cv::Scalar r_laser_col(255, 0, 0);         // 整条右线颜色
-  cv::namedWindow("vis_img", cv::WINDOW_NORMAL);
-  cv::resizeWindow("vis_img", vis_global.cols, vis_global.rows);
-#endif
-
-  // =============== 阶段1：增强候选生成 ===============
-
-  struct EnhancedCandidate {
-    IntervalMatch match;
-    bool is_high_quality;
-    float length_ratio;
-  };
-
-  tbb::concurrent_vector<EnhancedCandidate> all_enhanced_cands;
-  const int total_tasks = L * P;
-
-  tbb::parallel_for(
-      tbb::blocked_range<int>(0, total_tasks),
-      [&](const tbb::blocked_range<int> &range) {
-        for (int idx = range.begin(); idx != range.end(); ++idx) {
-          int l = idx / std::max(1, P);
-          int p = idx % std::max(1, P);
-          if (l < 0 || l >= L || p < 0 || p >= P)
-            continue;
-
-          const auto &ls = left_samples[l];
-          if (ls.ys.empty())
-            continue;
-
-          std::unordered_map<int, std::vector<std::pair<float, float>>> support;
-          int repro_cnt = 0;
-
-          const cv::Mat &coef = surfaces[p].coefficients;
-          for (size_t i = 0; i < ls.ys.size(); ++i) {
-            float y_f = ls.ys[i];
-            float x_f = ls.xs[i];
-
-            const cv::Point3f &ray = ls.rays[i];
-            auto ips = findIntersection(cv::Point3f(0, 0, 0), ray, coef);
-            if (ips.empty())
-              continue;
-
-            cv::Point3f pt3;
-            bool ok = false;
-            for (auto &q : ips) {
-              if (q.z > 100 && q.z < 1500) {
-                pt3 = q;
-                ok = true;
-                break;
-              }
-            }
-            if (!ok)
-              continue;
-
-            cv::Point3f pr(pt3.x - static_cast<float>(baseline), pt3.y, pt3.z);
-            float xr = static_cast<float>(fx_r * pr.x / pr.z + cx_r);
-            float yr =
-                alignToPrecision(static_cast<float>(fy_r * pr.y / pr.z + cy_r));
-            if (xr < 0 || xr >= img_cols || yr < 0 || yr >= img_rows)
-              continue;
-
-            ++repro_cnt;
-
-            for (int r = 0; r < R; ++r) {
-              const auto &rv = right_vec[r];
-              if (rv.empty())
-                continue;
-
-              auto it =
-                  std::lower_bound(rv.begin(), rv.end(), yr,
-                                   [](const std::pair<float, LaserPoint> &a,
-                                      float v) { return a.first < v; });
-              if (it != rv.begin()) {
-                auto prev = it - 1;
-                if (it == rv.end() ||
-                    std::fabs(prev->first - yr) < std::fabs(it->first - yr)) {
-                  it = prev;
-                }
-              }
-              if (it == rv.end())
-                continue;
-              if (std::fabs(it->first - yr) > EPS_)
-                continue;
-
-              float d = std::hypot(it->second.x - xr, it->second.y - yr);
-              if (d > D_thresh_)
-                continue;
-
-              support[r].emplace_back(yr, d);
-            }
-          }
-
-          // 生成增强候选
-          for (auto &ent : support) {
-            int r_idx = ent.first;
-            auto vec = std::move(ent.second);
-            if (vec.empty())
-              continue;
-
-            std::sort(vec.begin(), vec.end(), [](const auto &a, const auto &b) {
-              return a.first < b.first;
-            });
-
-            // 拆分子段
-            std::vector<Interval> segs;
-            int start = 0;
-            for (int i = 1; i < static_cast<int>(vec.size()); ++i) {
-              float gap = vec[i].first - vec[i - 1].first;
-              if (gap > 2.0f * precision_ + EPS_) {
-                Interval iv{alignToPrecision(vec[start].first),
-                            alignToPrecision(vec[i - 1].first), i - start};
-                segs.push_back(iv);
-                start = i;
-              }
-            }
-            Interval ivlast{alignToPrecision(vec[start].first),
-                            alignToPrecision(vec.back().first),
-                            static_cast<int>(vec.size()) - start};
-            segs.push_back(ivlast);
-
-            int total_count = 0;
-            for (const auto &iv : segs)
-              total_count += iv.count;
-            if (total_count < MIN_LEN_)
-              continue;
-
-            // 收集评分数据
-            std::vector<std::pair<float, float>> allpd;
-            allpd.reserve(vec.size());
-            for (auto &pd : vec) {
-              for (auto &iv : segs) {
-                if (pd.first >= iv.y_start - EPS_ &&
-                    pd.first <= iv.y_end + EPS_) {
-                  allpd.push_back(pd);
-                  break;
-                }
-              }
-            }
-
-            // 使用改进的评分函数
-            float std_dev = 0.0f, coverage = 0.0f;
-            int right_point_count =
-                static_cast<int>(laser_r[r_idx].points.size());
-            float score =
-                computeEnhancedScoreV2(allpd, ls.original_point_count,
-                                       right_point_count, coverage, std_dev);
-
-            if (score <= S_thresh_) {
-              EnhancedCandidate cand;
-              cand.match.l_idx = l;
-              cand.match.p_idx = p;
-              cand.match.r_idx = r_idx;
-              cand.match.intervals = std::move(segs);
-              cand.match.score = score;
-              cand.match.coverage = coverage;
-              cand.match.std_dev = std_dev;
-
-              // 计算长度比
-              cand.length_ratio = static_cast<float>(ls.original_point_count) /
-                                  right_point_count;
-
-              // 判断是否为高质量匹配：点数>=1000且得分<=1.5
-              if (ls.original_point_count >= 1000 &&
-                  ls.original_point_count <= 1300 &&
-                  right_point_count >= 1000 && right_point_count < 1300 &&
-                  score <= 2.3f)
-                cand.is_high_quality = true;
-              else if (ls.original_point_count > 1300 &&
-                       ls.original_point_count <= 2400 &&
-                       right_point_count > 1300 && right_point_count <= 2400 &&
-                       score <= S_thresh_)
-                cand.is_high_quality = true;
-              else
-                cand.is_high_quality = false;
-
-              all_enhanced_cands.push_back(std::move(cand));
-            }
-
-            if (l == 12 && r_idx == 6)
-              printf("l%d(%d)-r%d(%d), score: %.3f\n", l,
-                     ls.original_point_count, r_idx, right_point_count, score);
-            // printf("l%d-r%d, score: %.3f\n", l,  r_idx, score);
-          }
-        }
-      });
-
-  // =============== 阶段2：高质量优先匹配 ===============
-
-  std::vector<IntervalMatch> high_quality_matches;
-  std::vector<bool> left_used(L, false), right_used(R, false);
-
-  // 筛选并排序高质量候选（包含第一次和第二次筛选的结果）
-  std::vector<EnhancedCandidate> high_quality_cands;
-  for (const auto &cand : all_enhanced_cands) {
-    if (cand.is_high_quality) {
-      high_quality_cands.push_back(cand);
-    }
-  }
-
-  // 按得分排序，贪心选择最优匹配
-  std::sort(high_quality_cands.begin(), high_quality_cands.end(),
-            [](const auto &a, const auto &b) {
-              return a.match.score < b.match.score;
-            });
-
-  for (const auto &cand : high_quality_cands) {
-    int l_idx = cand.match.l_idx;
-    int r_idx = cand.match.r_idx;
-    if (!left_used[l_idx] && !right_used[r_idx]) {
-      high_quality_matches.push_back(cand.match);
-      left_used[l_idx] = true;
-      right_used[r_idx] = true;
-    }
-  }
-
-  // =============== 阶段3：剩余线约束匈牙利匹配 ===============
-
-  const double INF_COST = 1e9;
-  int n = std::max(L, R);
-  std::vector<std::vector<double>> cost(n, std::vector<double>(n, INF_COST));
-  std::vector<std::vector<IntervalMatch>> best_pair(
-      L, std::vector<IntervalMatch>(R));
-  std::vector<std::vector<bool>> has_best(L, std::vector<bool>(R, false));
-
-  // 构建最优候选矩阵（包括所有候选，不仅仅是高质量的）
-  for (const auto &cand : all_enhanced_cands) {
-    int l = cand.match.l_idx;
-    int r = cand.match.r_idx;
-    if (l < 0 || l >= L || r < 0 || r >= R)
-      continue;
-
-    if (!has_best[l][r] || cand.match.score < best_pair[l][r].score) {
-      best_pair[l][r] = cand.match;
-      has_best[l][r] = true;
-    }
-  }
-
-  // 填充约束成本矩阵
-  for (int l = 0; l < L; ++l) {
-    for (int r = 0; r < R; ++r) {
-      if (left_used[l] || right_used[r]) {
-        cost[l][r] = INF_COST;
-        continue;
-      }
-
-      if (has_best[l][r]) {
-        const auto &match = best_pair[l][r];
-
-        // 长度一致性约束
-        float left_len = static_cast<float>(laser_l[l].points.size());
-        float right_len = static_cast<float>(laser_r[r].points.size());
-        float ratio = left_len / right_len;
-
-        if (ratio < 0.3f || ratio > 3.0f) {
-          cost[l][r] = INF_COST; // 长度差异过大
-        } else {
-          // 基础得分 + 长度不一致惩罚
-          float length_penalty = std::abs(1.0f - ratio) * 5.0f;
-          cost[l][r] = static_cast<double>(match.score + length_penalty);
-        }
-      } else {
-        cost[l][r] = INF_COST;
-      }
-    }
-  }
-
-  // 匈牙利求解
-  std::vector<int> matchL;
-  hungarian1(cost, matchL);
-
-  // 收集第一轮匹配结果
-  std::vector<IntervalMatch> first_round_matches = high_quality_matches;
-  for (int i = 0; i < n; ++i) {
-    int j = matchL[i];
-    if (i < L && j >= 0 && j < R && !left_used[i] && !right_used[j]) {
-      if (has_best[i][j] && best_pair[i][j].coverage >= 0.05f) {
-        IntervalMatch im = best_pair[i][j];
-        merge_intervals_vec(im.intervals);
-        first_round_matches.push_back(std::move(im));
-        left_used[i] = true;
-        right_used[j] = true;
-      }
-    }
-  }
-
-  printf("第一轮匹配完成：高质量匹配 %zu 个，匈牙利匹配 %zu 个，总计 %zu 个\n",
-         high_quality_matches.size(),
-         first_round_matches.size() - high_quality_matches.size(),
-         first_round_matches.size());
-  printf("高质量匹配详情：\n");
-  for (const auto &c : high_quality_matches) {
-    printf("L%d - R%d, score: %.3f, coverage: %.3f\n", c.l_idx, c.r_idx,
-           c.score, c.coverage);
-  }
-
-  // =============== 阶段4：线段分割与二次匹配 ===============
-
-  // 4.1 分割已匹配的线段，生成剩余可用段
-  struct LaserSegment {
-    int original_idx;
-    std::map<float, LaserPoint> points;
-    bool is_left;
-    int original_point_count;
-  };
-
-  auto splitMatchedLines = [&](const std::vector<LaserLine> &lines,
-                               const std::vector<IntervalMatch> &matches,
-                               bool is_left) -> std::vector<LaserSegment> {
-    std::vector<LaserSegment> segments;
-    std::vector<bool> line_used(lines.size(), false);
-
-    // 处理已匹配的线，分割出未匹配部分
-    for (const auto &match : matches) {
-      int line_idx = is_left ? match.l_idx : match.r_idx;
-      if (line_idx < 0 || line_idx >= static_cast<int>(lines.size()))
-        continue;
-
-      line_used[line_idx] = true;
-      const auto &line = lines[line_idx];
-      std::map<float, LaserPoint> remaining_points = line.points;
-
-      // 移除已匹配的区间
-      for (const auto &interval : match.intervals) {
-        auto it_start = remaining_points.lower_bound(interval.y_start - EPS_);
-        auto it_end = remaining_points.upper_bound(interval.y_end + EPS_);
-        remaining_points.erase(it_start, it_end);
-      }
-
-      // 将剩余点分割成连续段
-      if (!remaining_points.empty()) {
-        std::vector<std::map<float, LaserPoint>> continuous_segs;
-        std::map<float, LaserPoint> current_seg;
-
-        float prev_y = -1e6f;
-        for (const auto &[y, point] : remaining_points) {
-          if (y - prev_y > 2.0f * precision_ + EPS_ && !current_seg.empty()) {
-            if (current_seg.size() >= MIN_LEN_) {
-              continuous_segs.push_back(current_seg);
-            }
-            current_seg.clear();
-          }
-          current_seg[y] = point;
-          prev_y = y;
-        }
-
-        if (current_seg.size() >= MIN_LEN_) {
-          continuous_segs.push_back(current_seg);
-        }
-
-        // 添加有效段
-        for (auto &seg_points : continuous_segs) {
-          LaserSegment seg;
-          seg.original_idx = line_idx;
-          seg.points = std::move(seg_points);
-          seg.is_left = is_left;
-          seg.original_point_count = static_cast<int>(line.points.size());
-          segments.push_back(seg);
-        }
-      }
-    }
-
-    // 添加完全未匹配的线
-    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
-      if (!line_used[i] && lines[i].points.size() >= MIN_LEN_) {
-        LaserSegment seg;
-        seg.original_idx = i;
-        seg.points = lines[i].points;
-        seg.is_left = is_left;
-        seg.original_point_count = static_cast<int>(lines[i].points.size());
-        segments.push_back(seg);
-      }
-    }
-
-    return segments;
-  };
-
-  std::vector<LaserSegment> left_segments =
-      splitMatchedLines(laser_l, first_round_matches, true);
-  std::vector<LaserSegment> right_segments =
-      splitMatchedLines(laser_r, first_round_matches, false);
-
-  // 4.2 对剩余段进行二次匹配
-  std::vector<IntervalMatch> second_round_matches;
-
-  if (!left_segments.empty() && !right_segments.empty()) {
-    int SL = static_cast<int>(left_segments.size());
-    int SR = static_cast<int>(right_segments.size());
-    int sn = std::max(SL, SR);
-
-    std::vector<std::vector<double>> seg_cost(
-        sn, std::vector<double>(sn, INF_COST));
-    std::vector<std::vector<IntervalMatch>> seg_best(
-        SL, std::vector<IntervalMatch>(SR));
-    std::vector<std::vector<bool>> seg_has_best(SL,
-                                                std::vector<bool>(SR, false));
-
-    // 为段间生成候选（使用所有光平面）
-    tbb::concurrent_vector<EnhancedCandidate> seg_cands;
-
-    tbb::parallel_for(
-        tbb::blocked_range<int>(0, SL * SR * P),
-        [&](const tbb::blocked_range<int> &range) {
-          for (int idx = range.begin(); idx != range.end(); ++idx) {
-            int sl = idx / (SR * P);
-            int sr = (idx / P) % SR;
-            int p = idx % P;
-
-            if (sl >= SL || sr >= SR || p >= P)
-              continue;
-
-            const auto &left_seg = left_segments[sl];
-            const auto &right_seg = right_segments[sr];
-            const cv::Mat &coef = surfaces[p].coefficients;
-
-            std::vector<std::pair<float, float>> seg_matches;
-            int seg_repro_cnt = 0;
-
-            for (const auto &[y_f, left_point] : left_seg.points) {
-              float x_f = left_point.x;
-
-              // 重投影计算
-              cv::Point3f ray(
-                  (x_f - static_cast<float>(cx_l)) / static_cast<float>(fx_l),
-                  (y_f - static_cast<float>(cy_l)) / static_cast<float>(fy_l),
-                  1.0f);
-              float rn =
-                  std::sqrt(ray.x * ray.x + ray.y * ray.y + ray.z * ray.z);
-              if (rn > 0.0f)
-                ray *= (1.0f / rn);
-
-              auto ips = findIntersection(cv::Point3f(0, 0, 0), ray, coef);
-              if (ips.empty())
-                continue;
-
-              cv::Point3f pt3;
-              bool ok = false;
-              for (auto &q : ips) {
-                if (q.z > 100 && q.z < 1500) {
-                  pt3 = q;
-                  ok = true;
-                  break;
-                }
-              }
-              if (!ok)
-                continue;
-
-              cv::Point3f pr(pt3.x - static_cast<float>(baseline), pt3.y,
-                             pt3.z);
-              float xr = static_cast<float>(fx_r * pr.x / pr.z + cx_r);
-              float yr = alignToPrecision(
-                  static_cast<float>(fy_r * pr.y / pr.z + cy_r));
-              if (xr < 0 || xr >= img_cols || yr < 0 || yr >= img_rows)
-                continue;
-
-              ++seg_repro_cnt;
-
-              // 在右段中查找匹配点
-              auto it = right_seg.points.lower_bound(yr - EPS_);
-              if (it != right_seg.points.end() &&
-                  std::fabs(it->first - yr) <= EPS_) {
-                float d = std::hypot(it->second.x - xr, it->second.y - yr);
-                if (d <= D_thresh_) {
-                  seg_matches.emplace_back(yr, d);
-                }
-              }
-            }
-
-            if (seg_matches.size() >= MIN_LEN_) {
-              // 生成区间
-              std::sort(seg_matches.begin(), seg_matches.end());
-              std::vector<Interval> seg_intervals;
-
-              int start = 0;
-              for (int i = 1; i < static_cast<int>(seg_matches.size()); ++i) {
-                float gap = seg_matches[i].first - seg_matches[i - 1].first;
-                if (gap > 2.0f * precision_ + EPS_) {
-                  Interval iv{alignToPrecision(seg_matches[start].first),
-                              alignToPrecision(seg_matches[i - 1].first),
-                              i - start};
-                  seg_intervals.push_back(iv);
-                  start = i;
-                }
-              }
-              Interval ivlast{alignToPrecision(seg_matches[start].first),
-                              alignToPrecision(seg_matches.back().first),
-                              static_cast<int>(seg_matches.size()) - start};
-              seg_intervals.push_back(ivlast);
-
-              // 评分（使用V2版本，无短线惩罚）
-              float std_dev = 0.0f, coverage = 0.0f;
-              float score = computeEnhancedScoreV2(
-                  seg_matches, static_cast<int>(left_seg.points.size()),
-                  static_cast<int>(right_seg.points.size()), coverage, std_dev);
-
-              if (score <= S_thresh_) {
-                EnhancedCandidate seg_cand;
-                seg_cand.match.l_idx = left_seg.original_idx;
-                seg_cand.match.r_idx = right_seg.original_idx;
-                seg_cand.match.p_idx = p;
-                seg_cand.match.intervals = std::move(seg_intervals);
-                seg_cand.match.score = score;
-                seg_cand.match.coverage = coverage;
-                seg_cand.match.std_dev = std_dev;
-
-                // 段匹配相关信息
-                seg_cand.is_high_quality = false; // 段匹配不参与高质量判断
-                seg_cand.length_ratio =
-                    static_cast<float>(left_seg.points.size()) /
-                    static_cast<float>(right_seg.points.size());
-
-                seg_cands.push_back(std::move(seg_cand));
-              }
-              // if (score < 10.0f)
-              //     printf("l%d-r%d, score: %.3f\n", left_seg.original_idx,
-              //     right_seg.original_idx, score);
-            }
-          }
-        });
-
-    // 对段候选进行归约：保留每对(sl,sr)的最优候选
-    for (const auto &cand : seg_cands) {
-      // 需要将原始线索引映射回段索引
-      int sl = -1, sr = -1;
-      for (int i = 0; i < SL; ++i) {
-        if (left_segments[i].original_idx == cand.match.l_idx) {
-          sl = i;
-          break;
-        }
-      }
-      for (int i = 0; i < SR; ++i) {
-        if (right_segments[i].original_idx == cand.match.r_idx) {
-          sr = i;
-          break;
-        }
-      }
-
-      if (sl >= 0 && sr >= 0) {
-        if (!seg_has_best[sl][sr] ||
-            cand.match.score < seg_best[sl][sr].score) {
-          seg_best[sl][sr] = cand.match;
-          seg_has_best[sl][sr] = true;
-        }
-      }
-    }
-
-    // =============== 改进：使用全局贪心替代匈牙利算法 ===============
-
-    // 收集所有有效的段间候选
-    std::vector<IntervalMatch> segment_candidates;
-    for (const auto &cand : seg_cands) {
-      if (cand.match.score <= S_thresh_) {
-        IntervalMatch im = cand.match;
-        merge_intervals_vec(im.intervals);
-        segment_candidates.push_back(std::move(im));
-      }
-    }
-
-    printf("二次匹配阶段：收集到 %zu 个段间候选\n", segment_candidates.size());
-
-    // 使用全局贪心匹配，支持一对多匹配（区间不重叠）
-    second_round_matches = globalGreedyMatching(segment_candidates);
-  }
-
-  // =============== 合并所有匹配结果 ===============
-
-  std::vector<IntervalMatch> final_matches;
-  final_matches.reserve(first_round_matches.size() +
-                        second_round_matches.size());
-
-  // 添加第一轮匹配
-  for (auto &match : first_round_matches) {
-    merge_intervals_vec(match.intervals);
-    final_matches.push_back(std::move(match));
-  }
-
-  //   添加第二轮匹配
-  for (auto &match : second_round_matches) {
-    final_matches.push_back(std::move(match));
-  }
-
-  printf("match8最终结果：第一轮 %zu 个，第二轮 %zu 个，总计 %zu 个匹配\n",
-         first_round_matches.size(), second_round_matches.size(),
-         final_matches.size());
-
-  // 输出最终匹配的详细信息
-  for (size_t i = 0; i < final_matches.size(); ++i) {
-    const auto &match = final_matches[i];
-    printf("匹配%zu: L%d(%ld)-R%d(%ld), score: %.3f, intervals: ", i, match.l_idx, laser_l[match.l_idx].size(),
-           match.r_idx, laser_r[match.r_idx].size(), match.score);
-    for (const auto &iv : match.intervals) {
-      printf("[%.1f-%.1f] ", iv.y_start, iv.y_end);
-    }
-    printf("\n");
-  }
-
-#ifdef DEBUG_PLANE_MATCH_FINAL
-  cv::Mat vis_all;
-  cv::hconcat(rectify_l, rectify_r, vis_all);
-  if (vis_all.channels() == 1)
-    cv::cvtColor(vis_all, vis_all, cv::COLOR_GRAY2BGR);
-  int off_all = rectify_l.cols;
-
-  // 首先绘制所有匹配的线段（使用原有颜色）
-  static const std::vector<cv::Scalar> palette30 = {
-      {255, 0, 0},   {0, 255, 0},   {0, 0, 255},  {255, 255, 0}, {255, 0, 255},
-      {0, 255, 255}, {128, 0, 0},   {0, 128, 0},  {0, 0, 128},   {128, 128, 0},
-      {128, 0, 128}, {0, 128, 128}, {64, 0, 128}, {128, 64, 0},  {0, 128, 64},
-      {64, 128, 0},  {0, 64, 128},  {128, 0, 64}, {192, 192, 0}, {192, 0, 192},
-      {64, 255, 0},  {255, 64, 0},  {0, 64, 255}, {0, 255, 64},  {255, 0, 64},
-      {64, 0, 255},  {192, 0, 64},  {64, 192, 0}, {0, 192, 64},  {64, 0, 192}};
-  for (int idx = 0; idx < (int)final_matches.size(); ++idx) {
-    auto &m = final_matches[idx];
-    cv::Scalar col = palette30[idx % palette30.size()];
-    // 左图区间点
-    for (auto &iv : m.intervals)
-      for (float y0 = iv.y_start; y0 <= iv.y_end; y0 += precision_) {
-        auto itL = laser_l[m.l_idx].points.lower_bound(y0);
-        if (itL != laser_l[m.l_idx].points.begin()) {
-          // 比较 it 和前一个元素哪个更接近 y0
-          auto prev = std::prev(itL);
-          if (itL == laser_l[m.l_idx].points.end() ||
-              fabs(prev->first - y0) < fabs(itL->first - y0)) {
-            itL = prev;
-          }
-        }
-        if (fabs(itL->first - y0) > EPS_)
-          continue;
-        cv::circle(vis_all, cv::Point2f(itL->second.x, y0), 2, col, -1);
-      }
-    // 右图区间点
-    for (auto &iv : m.intervals)
-      for (float y0 = iv.y_start; y0 <= iv.y_end; y0 += precision_) {
-        auto itR = laser_r[m.r_idx].points.lower_bound(y0);
-        if (itR != laser_r[m.r_idx].points.begin()) {
-          // 比较 it 和前一个元素哪个更接近 y0
-          auto prev = std::prev(itR);
-          if (itR == laser_r[m.r_idx].points.end() ||
-              fabs(prev->first - y0) < fabs(itR->first - y0)) {
-            itR = prev;
-          }
-        }
-        if (fabs(itR->first - y0) > EPS_)
-          continue;
-        cv::circle(vis_all, cv::Point2f(itR->second.x + off_all, y0), 2, col,
-                   -1);
-      }
-  }
-
-  // 为所有左图激光线添加ID标签（绿色）
-  for (int i = 0; i < laser_l.size(); ++i) {
-    if (laser_l[i].points.empty())
-      continue;
-
-    // 计算整条线的中点位置
-    float min_y = std::numeric_limits<float>::max();
-    float max_y = std::numeric_limits<float>::lowest();
-
-    for (auto &point : laser_l[i].points) {
-      if (point.first < min_y)
-        min_y = point.first;
-      if (point.first > max_y)
-        max_y = point.first;
-    }
-
-    float mid_y = (min_y + max_y) / 2.0f;
-
-    // 找到中点对应的x坐标
-    auto itL = laser_l[i].points.lower_bound(mid_y);
-    if (itL != laser_l[i].points.begin()) {
-      auto prev = std::prev(itL);
-      if (itL == laser_l[i].points.end() ||
-          fabs(prev->first - mid_y) < fabs(itL->first - mid_y)) {
-        itL = prev;
-      }
-    }
-
-    if (fabs(itL->first - mid_y) <= EPS_) {
-      std::string labelL = "L" + std::to_string(i);
-      cv::putText(vis_all, labelL, cv::Point(itL->second.x, mid_y - 5),
-                  cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0),
-                  2.5); // 绿色
-    }
-  }
-
-  // 为所有右图激光线添加ID标签（绿色）
-  for (int i = 0; i < laser_r.size(); ++i) {
-    if (laser_r[i].points.empty())
-      continue;
-
-    // 计算整条线的中点位置
-    float min_y = std::numeric_limits<float>::max();
-    float max_y = std::numeric_limits<float>::lowest();
-
-    for (auto &point : laser_r[i].points) {
-      if (point.first < min_y)
-        min_y = point.first;
-      if (point.first > max_y)
-        max_y = point.first;
-    }
-
-    float mid_y = (min_y + max_y) / 2.0f;
-
-    // 找到中点对应的x坐标
-    auto itR = laser_r[i].points.lower_bound(mid_y);
-    if (itR != laser_r[i].points.begin()) {
-      auto prev = std::prev(itR);
-      if (itR == laser_r[i].points.end() ||
-          fabs(prev->first - mid_y) < fabs(itR->first - mid_y)) {
-        itR = prev;
-      }
-    }
-
-    if (fabs(itR->first - mid_y) <= EPS_) {
-      std::string labelR = "R" + std::to_string(i);
-      cv::putText(
-          vis_all, labelR, cv::Point(itR->second.x + off_all, mid_y - 5),
-          cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0), 2.5); // 绿色
-    }
-  }
-
-  cv::imshow("vis_img", vis_all);
-  cv::waitKey(0);
-  cv::destroyWindow("vis_img");
-
-//   static int dbg_idx = 0;
-//   cv::imwrite("debug_img/match_res_" + std::to_string(dbg_idx) + ".png",
-//               vis_all);
-//   dbg_idx++;
-#endif
-
-  return final_matches;
-}
+/************************************* MatchV8 ****************************************/
 
 
 /************************************* MatchV9
@@ -4589,6 +3912,33 @@ std::vector<IntervalMatch> LaserProcessor::globalGreedyMatching(
   return selected_matches;
 }
 
+// 自适应阈值计算：基于匹配点数和重叠比的动态阈值
+float LaserProcessor::computeAdaptiveThreshold(int matched_count, float overlap_ratio, float base_threshold) {
+  // 参数定义
+  const float N_ref = N_HIGH;        // 参考大样本点数 (1100.0f)
+  const float beta = 0.5f;           // 对长度的敏感度
+  const float alpha = 0.8f;          // 对overlap的敏感度
+  const float S_min = 0.2f;          // 下限：防止过严
+  const float S_max = 5.0f;         // 上限：防止过松
+  
+  // 1. 长度归一化：clamp(n / N_ref, 0..1)
+  float len_norm = std::clamp(static_cast<float>(matched_count) / N_ref, 0.0f, 1.0f);
+  
+  // 2. 重叠比已经在[0,1]范围内，直接使用
+  float overlap_clamped = std::clamp(overlap_ratio, 0.0f, 1.0f);
+  
+  // 3. 计算自适应阈值
+  // S_adaptive = S_base * (len_norm^beta) * (overlap^alpha)
+  float len_factor = std::pow(len_norm, beta);
+  float overlap_factor = std::pow(overlap_clamped, alpha);
+  
+  float adaptive_threshold = base_threshold * len_factor * overlap_factor;
+  
+  // 4. 边界保护
+  adaptive_threshold = std::clamp(adaptive_threshold, S_min, S_max);
+  
+  return adaptive_threshold;
+}
 
 std::vector<IntervalMatch>
 LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
@@ -4610,7 +3960,7 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
   double cx_r = calib.P[1].at<double>(0, 2), cy_r = calib.P[1].at<double>(1, 2);
   double baseline = -calib.P[1].at<double>(0, 3) / fx_r;
 
-  // =============== 阶段1：自适应预处理 ===============
+  // =============== 预计算处理 ===============
 
   // 1.1 高质量匹配阈值设定
   const int HIGH_QUALITY_POINT_THRESH = 1000;   // 高质量线的点数阈值
@@ -4714,13 +4064,11 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
                 break;
               }
             }
-            if (!ok)
-              continue;
+            if (!ok) continue;
 
             cv::Point3f pr(pt3.x - static_cast<float>(baseline), pt3.y, pt3.z);
             float xr = static_cast<float>(fx_r * pr.x / pr.z + cx_r);
-            float yr =
-                alignToPrecision(static_cast<float>(fy_r * pr.y / pr.z + cy_r));
+            float yr = alignToPrecision(static_cast<float>(fy_r * pr.y / pr.z + cy_r));
             if (xr < 0 || xr >= img_cols || yr < 0 || yr >= img_rows)
               continue;
 
@@ -4804,10 +4152,9 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
 
             // 使用改进的评分函数
             float std_dev = 0.0f, coverage = 0.0f;
-            int right_point_count =
-                static_cast<int>(laser_r[r_idx].points.size());
+            int right_point_count = static_cast<int>(laser_r[r_idx].points.size());
             float score =
-                computeEnhancedScoreV2(allpd, ls.original_point_count,
+                computeShortBasedScore(allpd, ls.original_point_count,
                                        right_point_count, coverage, std_dev);
 
             if (score <= S_thresh_) {
@@ -4824,7 +4171,7 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
               cand.length_ratio = static_cast<float>(ls.original_point_count) /
                                   right_point_count;
 
-              // 判断是否为高质量匹配：点数>=1000且得分<=1.5
+              // 判断是否为高质量匹配：点数>=1000且得分<=2.3
               if (ls.original_point_count >= 1000 &&
                   ls.original_point_count <= 1300 &&
                   right_point_count >= 1000 && right_point_count < 1300 &&
@@ -4841,9 +4188,9 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
               all_enhanced_cands.push_back(std::move(cand));
             }
 
-            if (l == 12 && r_idx == 6)
-              printf("l%d(%d)-r%d(%d), score: %.3f\n", l,
-                     ls.original_point_count, r_idx, right_point_count, score);
+            if ((l == 5 && r_idx == 3) || (l == 5 && r_idx == 0) || (l == 2 && r_idx == 3) || (l == 2 && r_idx == 8) || (l == 8 && r_idx == 8))
+              printf("l%d(%d)-r%d(%d), score: %.3f std_dev: %.3f cov: %.3f\n", l,
+                     ls.original_point_count, r_idx, right_point_count, score, std_dev, coverage);
             // printf("l%d-r%d, score: %.3f\n", l,  r_idx, score);
           }
         }
@@ -4853,53 +4200,6 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
 
   std::vector<IntervalMatch> high_quality_matches;
   std::vector<bool> left_used(L, false), right_used(R, false);
-
-  // =============== 第二次高质量筛选：基于左线最优与次优分数差距
-  // ===============
-
-  // 1. 按左线分组所有候选，找出每条左线的最优和次优匹配
-  std::vector<std::vector<EnhancedCandidate>> left_line_candidates(L);
-  for (const auto &cand : all_enhanced_cands) {
-    left_line_candidates[cand.match.l_idx].push_back(cand);
-  }
-
-  // 2. 对每条左线的候选按分数排序，并进行第二次高质量判断
-  for (int l = 0; l < L; ++l) {
-    auto &candidates = left_line_candidates[l];
-    if (candidates.size() < 1)
-      continue;
-
-    // 按分数排序（分数越小越好）
-    std::sort(candidates.begin(), candidates.end(),
-              [](const EnhancedCandidate &a, const EnhancedCandidate &b) {
-                return a.match.score < b.match.score;
-              });
-
-    // 检查最优匹配是否满足第二次高质量条件
-    const auto &best_cand = candidates[0];
-    if (best_cand.match.score < 1.0f && candidates.size() >= 2) {
-      const auto &second_best_cand = candidates[1];
-      float score_ratio = second_best_cand.match.score / best_cand.match.score;
-
-      // 当最优分数<1且与次优分数差距>3倍时，标记为高质量
-      if (score_ratio > 3.0f) {
-        // 更新原始候选中的高质量标记
-        for (auto &cand : all_enhanced_cands) {
-          if (cand.match.l_idx == best_cand.match.l_idx &&
-              cand.match.r_idx == best_cand.match.r_idx &&
-              cand.match.p_idx == best_cand.match.p_idx) {
-            cand.is_high_quality = true;
-            printf("第二次高质量筛选：L%d-R%d, 最优分数: %.3f, 次优分数: %.3f, "
-                   "分数比: %.2f\n",
-                   best_cand.match.l_idx, best_cand.match.r_idx,
-                   best_cand.match.score, second_best_cand.match.score,
-                   score_ratio);
-            break;
-          }
-        }
-      }
-    }
-  }
 
   // 筛选并排序高质量候选（包含第一次和第二次筛选的结果）
   std::vector<EnhancedCandidate> high_quality_cands;
@@ -5200,7 +4500,7 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
 
               // 评分（使用V2版本，无短线惩罚）
               float std_dev = 0.0f, coverage = 0.0f;
-              float score = computeEnhancedScoreV2(
+              float score = computeShortBasedScore(
                   seg_matches, static_cast<int>(left_seg.points.size()),
                   static_cast<int>(right_seg.points.size()), coverage, std_dev);
 
@@ -5442,6 +4742,534 @@ LaserProcessor::match9(const std::vector<LaserLine> &laser_l,
 
   return final_matches;
 }
+
+
+std::vector<IntervalMatch>
+LaserProcessor::match10(const std::vector<LaserLine> &laser_l,
+                       const std::vector<LaserLine> &laser_r,
+                       const cv::Mat &rectify_l, const cv::Mat &rectify_r) {
+  const int img_rows = rectify_l.rows;
+  const int img_cols = rectify_l.cols;
+  const int L = static_cast<int>(laser_l.size());
+  const int R = static_cast<int>(laser_r.size());
+
+  const auto calib = ConfigManager::getInstance().getCalibInfo();
+  const auto surfaces = ConfigManager::getInstance().getQuadSurfaces();
+  const int P = static_cast<int>(surfaces.size());
+
+  // 相机内参
+  double fx_l = calib.P[0].at<double>(0, 0), fy_l = calib.P[0].at<double>(1, 1);
+  double cx_l = calib.P[0].at<double>(0, 2), cy_l = calib.P[0].at<double>(1, 2);
+  double fx_r = calib.P[1].at<double>(0, 0), fy_r = calib.P[1].at<double>(1, 1);
+  double cx_r = calib.P[1].at<double>(0, 2), cy_r = calib.P[1].at<double>(1, 2);
+  double baseline = -calib.P[1].at<double>(0, 3) / fx_r;
+
+  // =============== 阶段1：自适应预处理 ===============
+
+  // 1.1 高质量匹配阈值设定
+  const int HIGH_QUALITY_POINT_THRESH = 1000;   // 高质量线的点数阈值
+  const float HIGH_QUALITY_SCORE_THRESH = 2.3f; // 高质量线的得分阈值
+
+  // 1.2 预处理右线数据
+  std::vector<std::vector<std::pair<float, LaserPoint>>> right_vec(R);
+  for (int r = 0; r < R; ++r) {
+    right_vec[r].reserve(laser_r[r].points.size());
+    for (const auto &kv : laser_r[r].points) {
+      right_vec[r].emplace_back(kv.first, kv.second);
+    }
+  }
+
+  // 1.3 预计算左线采样数据
+  struct LeftSample {
+    std::vector<float> ys, xs;
+    std::vector<cv::Point3f> rays;
+    int original_point_count;
+  };
+  std::vector<LeftSample> left_samples(L);
+  for (int l = 0; l < L; ++l) {
+    const auto &mp = laser_l[l].points;
+    auto &ls = left_samples[l];
+    ls.original_point_count = static_cast<int>(mp.size());
+    ls.ys.reserve(mp.size());
+    ls.xs.reserve(mp.size());
+    ls.rays.reserve(mp.size());
+
+    for (const auto &kv : mp) {
+      float y_f = kv.first;
+      float x_f = kv.second.x;
+      ls.ys.push_back(y_f);
+      ls.xs.push_back(x_f);
+      cv::Point3f ray(
+          (x_f - static_cast<float>(cx_l)) / static_cast<float>(fx_l),
+          (y_f - static_cast<float>(cy_l)) / static_cast<float>(fy_l), 1.0f);
+      float rn = std::sqrt(ray.x * ray.x + ray.y * ray.y + ray.z * ray.z);
+      if (rn > 0.0f)
+        ray *= (1.0f / rn);
+      ls.rays.push_back(ray);
+    }
+  }
+
+#ifdef DEBUG_PLANE_MATCH_FINAL
+  // 全局可视化底图
+  cv::Mat vis_global;
+  cv::hconcat(rectify_l, rectify_r, vis_global);
+  if (vis_global.channels() == 1)
+    cv::cvtColor(vis_global, vis_global, cv::COLOR_GRAY2BGR);
+  int off = rectify_l.cols;
+  static const cv::Scalar proc_interval_col(0, 255, 255); // 候选区间颜色
+  static const cv::Scalar r_laser_col(255, 0, 0);         // 整条右线颜色
+  cv::namedWindow("vis_img", cv::WINDOW_NORMAL);
+  cv::resizeWindow("vis_img", vis_global.cols, vis_global.rows);
+#endif
+
+  // =============== 阶段1：增强候选生成 ===============
+
+  struct EnhancedCandidate {
+    IntervalMatch match;
+    bool is_high_quality;
+    float length_ratio;
+  };
+
+  tbb::concurrent_vector<EnhancedCandidate> all_enhanced_cands;
+  const int total_tasks = L * P;
+
+  tbb::parallel_for(
+      tbb::blocked_range<int>(0, total_tasks),
+      [&](const tbb::blocked_range<int> &range) {
+        for (int idx = range.begin(); idx != range.end(); ++idx) {
+          int l = idx / std::max(1, P);
+          int p = idx % std::max(1, P);
+          if (l < 0 || l >= L || p < 0 || p >= P)
+            continue;
+
+          const auto &ls = left_samples[l];
+          if (ls.ys.empty())
+            continue;
+
+          std::unordered_map<int, std::vector<std::pair<float, float>>> support;
+          int repro_cnt = 0;
+
+          const cv::Mat &coef = surfaces[p].coefficients;
+          for (size_t i = 0; i < ls.ys.size(); ++i) {
+            float y_f = ls.ys[i];
+            float x_f = ls.xs[i];
+
+            const cv::Point3f &ray = ls.rays[i];
+            auto ips = findIntersection(cv::Point3f(0, 0, 0), ray, coef);
+            if (ips.empty())
+              continue;
+
+            cv::Point3f pt3;
+            bool ok = false;
+            for (auto &q : ips) {
+              if (q.z > 100 && q.z < 1500) {
+                pt3 = q;
+                ok = true;
+                break;
+              }
+            }
+            if (!ok) continue;
+
+            cv::Point3f pr(pt3.x - static_cast<float>(baseline), pt3.y, pt3.z);
+            float xr = static_cast<float>(fx_r * pr.x / pr.z + cx_r);
+            float yr = alignToPrecision(static_cast<float>(fy_r * pr.y / pr.z + cy_r));
+            if (xr < 0 || xr >= img_cols || yr < 0 || yr >= img_rows)
+              continue;
+
+            ++repro_cnt;
+
+            for (int r = 0; r < R; ++r) {
+              const auto &rv = right_vec[r];
+              if (rv.empty())
+                continue;
+
+              auto it =
+                  std::lower_bound(rv.begin(), rv.end(), yr,
+                                   [](const std::pair<float, LaserPoint> &a,
+                                      float v) { return a.first < v; });
+              if (it != rv.begin()) {
+                auto prev = it - 1;
+                if (it == rv.end() ||
+                    std::fabs(prev->first - yr) < std::fabs(it->first - yr)) {
+                  it = prev;
+                }
+              }
+              if (it == rv.end())
+                continue;
+              if (std::fabs(it->first - yr) > EPS_)
+                continue;
+
+              float d = std::hypot(it->second.x - xr, it->second.y - yr);
+              if (d > D_thresh_)
+                continue;
+
+              support[r].emplace_back(yr, d);
+            }
+          }
+
+          // 生成增强候选
+          for (auto &ent : support) {
+            int r_idx = ent.first;
+            auto vec = std::move(ent.second);
+            if (vec.empty())
+              continue;
+
+            std::sort(vec.begin(), vec.end(), [](const auto &a, const auto &b) {
+              return a.first < b.first;
+            });
+
+            // 拆分子段
+            std::vector<Interval> segs;
+            int start = 0;
+            for (int i = 1; i < static_cast<int>(vec.size()); ++i) {
+              float gap = vec[i].first - vec[i - 1].first;
+              if (gap > 2.0f * precision_ + EPS_) {
+                Interval iv{alignToPrecision(vec[start].first),
+                            alignToPrecision(vec[i - 1].first), i - start};
+                segs.push_back(iv);
+                start = i;
+              }
+            }
+            Interval ivlast{alignToPrecision(vec[start].first),
+                            alignToPrecision(vec.back().first),
+                            static_cast<int>(vec.size()) - start};
+            segs.push_back(ivlast);
+
+            int total_count = 0;
+            for (const auto &iv : segs)
+              total_count += iv.count;
+            if (total_count < MIN_LEN_)
+              continue;
+
+            // 收集评分数据
+            std::vector<std::pair<float, float>> allpd;
+            allpd.reserve(vec.size());
+            for (auto &pd : vec) {
+              for (auto &iv : segs) {
+                if (pd.first >= iv.y_start - EPS_ &&
+                    pd.first <= iv.y_end + EPS_) {
+                  allpd.push_back(pd);
+                  break;
+                }
+              }
+            }
+
+            // 使用改进的评分函数
+            float std_dev = 0.0f, coverage = 0.0f;
+            int right_point_count =
+                static_cast<int>(laser_r[r_idx].points.size());
+            float score =
+                computeShortBasedScore(allpd, ls.original_point_count,
+                                       right_point_count, coverage, std_dev);
+
+            if (score <= S_thresh_) {
+              EnhancedCandidate cand;
+              cand.match.l_idx = l;
+              cand.match.p_idx = p;
+              cand.match.r_idx = r_idx;
+              cand.match.intervals = std::move(segs);
+              cand.match.score = score;
+              cand.match.coverage = coverage;
+              cand.match.std_dev = std_dev;
+
+              // 计算长度比
+              cand.length_ratio = static_cast<float>(ls.original_point_count) /
+                                  right_point_count;
+
+              // 判断是否为高质量匹配：点数>=1000且得分<=2.3
+              if (ls.original_point_count >= 1000 &&
+                  ls.original_point_count <= 1300 &&
+                  right_point_count >= 1000 && right_point_count < 1300 &&
+                  score <= 2.3f && coverage > 0.7f)
+                cand.is_high_quality = true;
+              else if (ls.original_point_count > 1300 &&
+                       ls.original_point_count <= 2400 &&
+                       right_point_count > 1300 && right_point_count <= 2400 &&
+                       score <= S_thresh_ && coverage > 0.7f)
+                cand.is_high_quality = true;
+              else
+                cand.is_high_quality = false;
+
+              all_enhanced_cands.push_back(std::move(cand));
+            }
+
+            if (l == 12 && (r_idx == 11 || r_idx == 5))
+              printf("l%d(%d)-r%d(%d), score: %.3f std_dev: %.3f cov: %.3f\n", l,
+                     ls.original_point_count, r_idx, right_point_count, score, std_dev, coverage);
+            // printf("l%d-r%d, score: %.3f\n", l,  r_idx, score);
+          }
+        }
+      });
+
+   // =============== 阶段2：高质量优先匹配 ===============
+
+  std::vector<IntervalMatch> high_quality_matches;
+  std::vector<bool> left_used(L, false), right_used(R, false);
+
+  // 第一次高质量筛选
+  std::vector<EnhancedCandidate> first_high_quality_cands;
+  for (const auto &cand : all_enhanced_cands) {
+    if (cand.is_high_quality) {
+      first_high_quality_cands.push_back(cand);
+    }
+  }
+
+  // 按得分排序，贪心选择最优匹配
+  std::sort(first_high_quality_cands.begin(), first_high_quality_cands.end(),
+            [](const auto &a, const auto &b) {
+              return a.match.score < b.match.score;
+            });
+
+  for (const auto &cand : first_high_quality_cands) {
+    int l_idx = cand.match.l_idx;
+    int r_idx = cand.match.r_idx;
+    if (!left_used[l_idx] && !right_used[r_idx]) {
+      high_quality_matches.push_back(cand.match);
+      left_used[l_idx] = true;
+      right_used[r_idx] = true;
+      printf("第一次高质量匹配：L%d-R%d, 分数: %.3f\n", l_idx, r_idx, cand.match.score);
+    }
+  }
+
+  // =============== 第二次高质量筛选：基于左线最优与次优分数差距 ===============
+
+  // 1. 按左线分组所有候选，只考虑未被使用的左线和右线
+  std::vector<std::vector<EnhancedCandidate>> left_line_candidates(L);
+  for (const auto &cand : all_enhanced_cands) {
+    int l_idx = cand.match.l_idx;
+    int r_idx = cand.match.r_idx;
+    
+    // 只考虑未被使用的左线和右线
+    if (!left_used[l_idx] && !right_used[r_idx]) {
+      left_line_candidates[l_idx].push_back(cand);
+    }
+  }
+
+  // 2. 对每条未被使用的左线的候选按分数排序，并进行第二次高质量判断
+  std::vector<EnhancedCandidate> second_high_quality_cands;
+  for (int l = 0; l < L; ++l) {
+    // 跳过已经被使用的左线
+    if (left_used[l]) continue;
+    
+    auto &candidates = left_line_candidates[l];
+    if (candidates.size() < 1) continue;
+
+    // 按分数排序（分数越小越好）
+    std::sort(candidates.begin(), candidates.end(),
+              [](const EnhancedCandidate &a, const EnhancedCandidate &b) {
+                return a.match.score < b.match.score;
+              });
+
+    // 检查最优匹配是否满足第二次高质量条件
+    const auto &best_cand = candidates[0];
+    
+    if (best_cand.match.score < 1.0f) {
+      if (candidates.size() == 1) {
+        // 唯一候选且分数优秀
+        second_high_quality_cands.push_back(best_cand);
+        printf("第二次高质量筛选：L%d-R%d, 最优分数: %.3f, 唯一\n",
+               best_cand.match.l_idx, best_cand.match.r_idx,
+               best_cand.match.score);
+      } else if (candidates.size() >= 2) {
+        const auto &second_best_cand = candidates[1];
+        float score_ratio = second_best_cand.match.score / best_cand.match.score;
+
+        // 当最优分数<1且与次优分数差距>3倍时，标记为高质量
+        if (score_ratio > 3.0f) {
+          second_high_quality_cands.push_back(best_cand);
+          printf("第二次高质量筛选：L%d-R%d, 最优分数: %.3f, 次优分数: %.3f, "
+                 "分数比: %.2f\n",
+                 best_cand.match.l_idx, best_cand.match.r_idx,
+                 best_cand.match.score, second_best_cand.match.score,
+                 score_ratio);
+        }
+      }
+    }
+  }
+
+  // 添加第二次高质量匹配
+  for (const auto &cand : second_high_quality_cands) {
+    int l_idx = cand.match.l_idx;
+    int r_idx = cand.match.r_idx;
+    if (!left_used[l_idx] && !right_used[r_idx]) {
+      high_quality_matches.push_back(cand.match);
+      left_used[l_idx] = true;
+      right_used[r_idx] = true;
+    }
+  }
+
+  printf("高质量匹配详情：\n");
+  for (const auto &c : high_quality_matches) {
+    printf("L%d - R%d, score: %.3f, coverage: %.3f\n", c.l_idx, c.r_idx,
+           c.score, c.coverage);
+  }
+
+  std::vector<IntervalMatch> final_matches;
+  final_matches.reserve(high_quality_matches.size());
+
+  // 添加所有高质量匹配
+  for (auto &match : high_quality_matches) {
+    merge_intervals_vec(match.intervals);
+    final_matches.push_back(std::move(match));
+  }
+
+  // 输出最终匹配的详细信息
+  for (size_t i = 0; i < final_matches.size(); ++i) {
+    const auto &match = final_matches[i];
+    printf("匹配%zu: L%d-R%d, score: %.3f, intervals: ", i, match.l_idx,
+           match.r_idx, match.score);
+    for (const auto &iv : match.intervals) {
+      printf("[%.1f-%.1f] ", iv.y_start, iv.y_end);
+    }
+    printf("\n");
+  }
+
+#ifdef DEBUG_PLANE_MATCH_FINAL
+  cv::Mat vis_all;
+  cv::hconcat(rectify_l, rectify_r, vis_all);
+  if (vis_all.channels() == 1)
+    cv::cvtColor(vis_all, vis_all, cv::COLOR_GRAY2BGR);
+  int off_all = rectify_l.cols;
+
+  // 统计连通区域数量
+  std::string left_count_str = "L: " + std::to_string(laser_l.size());
+  std::string right_count_str = "R: " + std::to_string(laser_r.size());
+  cv::putText(vis_all, left_count_str, cv::Point(10, 50), 
+              cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0), 2);
+  cv::putText(vis_all, right_count_str, cv::Point(off_all + 10, 50), 
+              cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0), 2);
+
+  // 首先绘制所有匹配的线段（使用原有颜色）
+  static const std::vector<cv::Scalar> palette30 = {
+      {255, 0, 0},   {0, 255, 0},   {0, 0, 255},  {255, 255, 0}, {255, 0, 255},
+      {0, 255, 255}, {128, 0, 0},   {0, 128, 0},  {0, 0, 128},   {128, 128, 0},
+      {128, 0, 128}, {0, 128, 128}, {64, 0, 128}, {128, 64, 0},  {0, 128, 64},
+      {64, 128, 0},  {0, 64, 128},  {128, 0, 64}, {192, 192, 0}, {192, 0, 192},
+      {64, 255, 0},  {255, 64, 0},  {0, 64, 255}, {0, 255, 64},  {255, 0, 64},
+      {64, 0, 255},  {192, 0, 64},  {64, 192, 0}, {0, 192, 64},  {64, 0, 192}};
+  for (int idx = 0; idx < (int)final_matches.size(); ++idx) {
+    auto &m = final_matches[idx];
+    cv::Scalar col = palette30[idx % palette30.size()];
+    // 左图区间点
+    for (auto &iv : m.intervals)
+      for (float y0 = iv.y_start; y0 <= iv.y_end; y0 += precision_) {
+        auto itL = laser_l[m.l_idx].points.lower_bound(y0);
+        if (itL != laser_l[m.l_idx].points.begin()) {
+          // 比较 it 和前一个元素哪个更接近 y0
+          auto prev = std::prev(itL);
+          if (itL == laser_l[m.l_idx].points.end() ||
+              fabs(prev->first - y0) < fabs(itL->first - y0)) {
+            itL = prev;
+          }
+        }
+        if (fabs(itL->first - y0) > EPS_)
+          continue;
+        cv::circle(vis_all, cv::Point2f(itL->second.x, y0), 2, col, -1);
+      }
+    // 右图区间点
+    for (auto &iv : m.intervals)
+      for (float y0 = iv.y_start; y0 <= iv.y_end; y0 += precision_) {
+        auto itR = laser_r[m.r_idx].points.lower_bound(y0);
+        if (itR != laser_r[m.r_idx].points.begin()) {
+          // 比较 it 和前一个元素哪个更接近 y0
+          auto prev = std::prev(itR);
+          if (itR == laser_r[m.r_idx].points.end() ||
+              fabs(prev->first - y0) < fabs(itR->first - y0)) {
+            itR = prev;
+          }
+        }
+        if (fabs(itR->first - y0) > EPS_)
+          continue;
+        cv::circle(vis_all, cv::Point2f(itR->second.x + off_all, y0), 2, col,
+                   -1);
+      }
+  }
+
+  // 为所有左图激光线添加ID标签（绿色）
+  for (int i = 0; i < laser_l.size(); ++i) {
+    if (laser_l[i].points.empty())
+      continue;
+
+    // 计算整条线的中点位置
+    float min_y = std::numeric_limits<float>::max();
+    float max_y = std::numeric_limits<float>::lowest();
+
+    for (auto &point : laser_l[i].points) {
+      if (point.first < min_y)
+        min_y = point.first;
+      if (point.first > max_y)
+        max_y = point.first;
+    }
+
+    float mid_y = (min_y + max_y) / 2.0f;
+
+    // 找到中点对应的x坐标
+    auto itL = laser_l[i].points.lower_bound(mid_y);
+    if (itL != laser_l[i].points.begin()) {
+      auto prev = std::prev(itL);
+      if (itL == laser_l[i].points.end() ||
+          fabs(prev->first - mid_y) < fabs(itL->first - mid_y)) {
+        itL = prev;
+      }
+    }
+
+    if (fabs(itL->first - mid_y) <= EPS_) {
+      std::string labelL = "L" + std::to_string(i);
+      cv::putText(vis_all, labelL, cv::Point(itL->second.x, mid_y - 5),
+                  cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0),
+                  2.5); // 绿色
+    }
+  }
+
+  // 为所有右图激光线添加ID标签（绿色）
+  for (int i = 0; i < laser_r.size(); ++i) {
+    if (laser_r[i].points.empty())
+      continue;
+
+    // 计算整条线的中点位置
+    float min_y = std::numeric_limits<float>::max();
+    float max_y = std::numeric_limits<float>::lowest();
+
+    for (auto &point : laser_r[i].points) {
+      if (point.first < min_y)
+        min_y = point.first;
+      if (point.first > max_y)
+        max_y = point.first;
+    }
+
+    float mid_y = (min_y + max_y) / 2.0f;
+
+    // 找到中点对应的x坐标
+    auto itR = laser_r[i].points.lower_bound(mid_y);
+    if (itR != laser_r[i].points.begin()) {
+      auto prev = std::prev(itR);
+      if (itR == laser_r[i].points.end() ||
+          fabs(prev->first - mid_y) < fabs(itR->first - mid_y)) {
+        itR = prev;
+      }
+    }
+
+    if (fabs(itR->first - mid_y) <= EPS_) {
+      std::string labelR = "R" + std::to_string(i);
+      cv::putText(
+          vis_all, labelR, cv::Point(itR->second.x + off_all, mid_y - 5),
+          cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0), 2.5); // 绿色
+    }
+  }
+
+  cv::imshow("vis_img", vis_all);
+  cv::waitKey(0);
+  cv::destroyWindow("vis_img");
+
+  static int dbg_idx = 1;
+  cv::imwrite("debug_img/match_res_" + std::to_string(dbg_idx) + ".png",
+              vis_all);
+  dbg_idx++;
+#endif
+
+  return final_matches;
+}
+
 
 
 /************************************** 同名点匹配

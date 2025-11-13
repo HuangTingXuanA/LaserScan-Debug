@@ -22,6 +22,8 @@ struct CalibrationResult {
     cv::Mat P[2];               // 极线校正后的3*4投影矩阵，P2 的基线非零（单位：毫米）
     cv::Mat rectify_R[2];
     cv::Mat Q;                  // 视差图到深度图的映射矩阵
+    cv::Rect valid_roi[2];      // 极线校正后的有效区域
+    cv::Rect common_roi;        // 双目图像裁剪后的公共有效区域
     std::vector<std::array<cv::Mat, 2>> remap;
     double baseline;            // 双目基线距离（单位：毫米）
     double l_rmse;                // 左侧相机标定精度
