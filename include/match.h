@@ -8,123 +8,104 @@
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_vector.h>
 
-// ============ 核心数据结构 ============
-
 // 左图采样点（预计算射线方向）
 struct LeftPoint {
-    float y, x;
+    float x;
+    float y;
     cv::Point3f ray;  // 归一化射线方向
     
-    LeftPoint(float y_, float x_, cv::Point3f ray_) : y(y_), x(x_), ray(ray_) {}
+    LeftPoint(float x_, float y_, cv::Point3f ray_) : x(x_), y(y_), ray(ray_) {}
 };
 
-// 匹配候选（并行阶段产生）
-struct MatchCandidate {
-    int l_idx, r_idx, p_idx;  // 左线、右线、光平面索引
-    float y;                   // 匹配点的y坐标
-    float distance;            // 匹配距离
+// 切片
+struct Slice {
+    int id;                 // 全局唯一ID (= all_slices数组下标)
+    int laser_idx;              // 原始激光线连通域索引 (laser_l或laser_r的下标)
+    int band_idx;           // 属于第几行扫描带 (用于调试分层)
     
-    MatchCandidate(int l, int r, int p, float y_, float d) 
-        : l_idx(l), r_idx(r), p_idx(p), y(y_), distance(d) {}
+    cv::Point2f center_pt;  // 切片重心
+    std::vector<LeftPoint> pts; // 切片内所有像素点坐标(x,y)
 };
 
-// 匹配三元组的键（用于分组）
-struct MatchKey {
-    int l_idx, r_idx, p_idx;
+// 扫描条带
+struct Band {
+    int idx;
     
-    bool operator<(const MatchKey &other) const {
-        if (l_idx != other.l_idx) return l_idx < other.l_idx;
-        if (r_idx != other.r_idx) return r_idx < other.r_idx;
-        return p_idx < other.p_idx;
+    // 1. 所有权存储：使用 unique_ptr 自动管理 Slice 内存生命周期
+    std::vector<std::unique_ptr<Slice>> slices_storage; 
+    
+    // 2. 访问视图：存储裸指针，用于排序和快速访问
+    // 注意：不要手动 delete 这里的指针，它们由 slices_storage 管理
+    std::vector<Slice*> slices; 
+    
+    // 辅助函数：添加切片
+    void addSlice(std::unique_ptr<Slice> s) {
+        // 先保存裸指针用于访问
+        slices.push_back(s.get());
+        // 再转移所有权给 storage
+        slices_storage.push_back(std::move(s));
     }
-    
-    std::string toString() const {
-        return "L" + std::to_string(l_idx) + "-R" + std::to_string(r_idx) + "-P" + std::to_string(p_idx);
-    }
-};
-
-// 区间段（贪心算法的基本单元）
-struct IntervalSegment {
-    int line_idx;              // 所属激光线索引
-    int pair_idx;              // 配对线索引（左线视角存右线索引，右线视角存左线索引）
-    int p_idx;                 // 光平面索引
-    std::vector<float> y_coords;  // 区间包含的y坐标（有序）
-    std::vector<std::pair<float, float>> match_points;  // (y, distance)
-    float avg_distance;        // 平均匹配距离
-    
-    // 辅助方法
-    float y_start() const { return y_coords.empty() ? 0.0f : y_coords.front(); }
-    float y_end() const { return y_coords.empty() ? 0.0f : y_coords.back(); }
-    int size() const { return static_cast<int>(y_coords.size()); }
-};
-
-// 激光线区域（分割后的连续段）
-struct LaserRegion {
-    int line_idx;              // 所属激光线索引
-    int region_id;             // 全局区域ID（按x坐标排序后分配）
-    int pair_idx;              // 配对线索引
-    int p_idx;                 // 光平面索引
-    std::vector<float> y_coords;  // 区间y坐标（有序）
-    std::vector<std::pair<float, float>> points;  // (y, x) 实际像素坐标
-    float center_x;            // 区间中心点x坐标（用于排序）
-    float avg_distance;        // 平均匹配距离
-    
-    // 辅助方法
-    float y_start() const { return y_coords.empty() ? 0.0f : y_coords.front(); }
-    float y_end() const { return y_coords.empty() ? 0.0f : y_coords.back(); }
-    int size() const { return static_cast<int>(y_coords.size()); }
 };
 
 // 评分信息
 struct ScoreInfo {
-    float coverage;
-    float dis_mode;
-    float dis_mean;
-    float dis_stddev;
-    float remain_penalty;
-    float score;
+    float score;          // 最终加权得分
+    float dis_mode;       // 距离众数
+    float dis_mean;       // 距离均值
+    float dis_stddev;     // 距离标准差
+    float norm_census;    // 归一化 Census 代价
+};
+
+// DP 状态节点
+struct DpNode {
+    float cost;
+    int prev_l, prev_r, prev_p;
+};
+
+// 存储 Cost Matrix 的单元
+struct CostEntry {
+    ScoreInfo info;
+    int r_idx;
 };
 
 // 最终匹配结果
-struct RegionMatch {
-    int l_idx, r_idx, p_idx;        // 左右线索引、光平面索引
-    int l_region_id, r_region_id;   // 左右区间ID
-    float y_start, y_end;           // 匹配区间范围
-    int match_count;                // 匹配点数
-    ScoreInfo score_info;           // 评分信息
+struct MatchResult {
+    int l_slice_id;  // -> 索引到 左侧 Slice
+    int r_slice_id;  // -> 索引到 右侧 Slice
+    int l_idx;       // -> 索引到 laser_l (冗余但方便)
+    int p_idx;       // -> 索引到 Surfaces (光平面)
+    int r_idx;       // -> 索引到 laser_r (匹配到的最佳右线，若无则为-1)
     
-    std::string key() const {
-        return std::string("L") + std::to_string(l_idx) + "(Reg" + std::to_string(l_region_id) + 
-               ")-R" + std::to_string(r_idx) + "(Reg" + std::to_string(r_region_id) + 
-               ")-P" + std::to_string(p_idx);
-    }
-    
-    // 兼容性访问器
-    float score() const { return score_info.score; }
-    float std_dev() const { return score_info.dis_stddev; }
+    ScoreInfo info;  // 详细评分
 };
 
 class MatchProcessor {
 public:
-    std::vector<RegionMatch> match(
+    std::vector<MatchResult> match(
         const std::vector<LaserLine> &laser_l, const std::vector<LaserLine> &laser_r,
         const cv::Mat &rectify_l, const cv::Mat &rectify_r
     );
-    ScoreInfo computePointScore(
-        const std::vector<std::pair<float, float>> &distance_pairs,
-        int pt_cnt_l, int pt_cnt_r
-    );
     std::vector<cv::Point3f> findIntersection(const cv::Point3f &point, const cv::Point3f &normal, const cv::Mat &Coeff6x1);
-    
+    int computeCensus(const cv::Mat& img1, const cv::Point2f& pt1,
+                         const cv::Mat& img2, const cv::Point2f& pt2, int window_size = 5);
+
 private:
     const float precision_ = 0.5f;
     const float D_thresh_ = 10.0f;
-    const float S_thresh_ = 3.5f;
+    const float S_thresh_ = 4.0f;
     const float EPS_ = 1e-4f;
     const int MIN_LEN_ = 160;
+    const int SLICE_HEIGHT_ = 30;
+    const float COST_INVALID_ = 100.0f;  // 提高无效代价阈值
     
     // 辅助函数：将y坐标对齐到精度网格
     inline float alignToPrecision(float y) {
         return std::round(y / precision_) * precision_;
     }
+
+    std::vector<Band> generateBands(const std::vector<LaserLine>& laser, const cv::Mat& P, int img_rows);
+    ScoreInfo computeCost(const Slice* slice_l, const Slice* slice_r, const cv::Mat& coef,
+                const cv::Mat& rectify_l, const cv::Mat& rectify_r);
+    
+    inline cv::Scalar getBandColor(int band_idx);
 };
