@@ -20,7 +20,7 @@ struct LeftPoint {
 // 切片
 struct Slice {
     int id;                 // 全局唯一ID (= all_slices数组下标)
-    int laser_idx;              // 原始激光线连通域索引 (laser_l或laser_r的下标)
+    int laser_idx;          // 原始激光线连通域索引 (laser_l或laser_r的下标)
     int band_idx;           // 属于第几行扫描带 (用于调试分层)
     
     cv::Point2f center_pt;  // 切片重心
@@ -32,18 +32,28 @@ struct Band {
     int idx;
     
     // 1. 所有权存储：使用 unique_ptr 自动管理 Slice 内存生命周期
-    std::vector<std::unique_ptr<Slice>> slices_storage; 
+    std::vector<std::unique_ptr<Slice>> storage; 
     
     // 2. 访问视图：存储裸指针，用于排序和快速访问
     // 注意：不要手动 delete 这里的指针，它们由 slices_storage 管理
     std::vector<Slice*> slices; 
+
+    // 3.辅助查找表: laser_idx -> Slice*
+    std::unordered_map<int, Slice*> laser2slice; 
     
     // 辅助函数：添加切片
     void addSlice(std::unique_ptr<Slice> s) {
         // 先保存裸指针用于访问
         slices.push_back(s.get());
         // 再转移所有权给 storage
-        slices_storage.push_back(std::move(s));
+        storage.push_back(std::move(s));
+    }
+
+    void buildLaserToSlice() {
+        laser2slice.clear();
+        for (auto* s : slices) {
+            laser2slice[s->laser_idx] = s;
+        }
     }
 };
 
@@ -68,8 +78,16 @@ struct CostEntry {
     int r_idx;
 };
 
+// RLE分析
+struct Run {
+    int p_idx;      // 光平面 ID
+    int start_idx;  // 在 group 中的起始下标
+    int len;        // 长度
+};
+
 // 最终匹配结果
 struct MatchResult {
+    int band_id;     // -> 索引到 Band
     int l_slice_id;  // -> 索引到 左侧 Slice
     int r_slice_id;  // -> 索引到 右侧 Slice
     int l_idx;       // -> 索引到 laser_l (冗余但方便)
@@ -85,6 +103,7 @@ public:
         const std::vector<LaserLine> &laser_l, const std::vector<LaserLine> &laser_r,
         const cv::Mat &rectify_l, const cv::Mat &rectify_r
     );
+    void filterMatches(std::vector<MatchResult>& matches, const std::vector<Band>& bands_l, const std::vector<Band>& bands_r);
     std::vector<cv::Point3f> findIntersection(const cv::Point3f &point, const cv::Point3f &normal, const cv::Mat &Coeff6x1);
     int computeCensus(const cv::Mat& img1, const cv::Point2f& pt1,
                          const cv::Mat& img2, const cv::Point2f& pt2, int window_size = 5);

@@ -12,14 +12,14 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
                       const std::vector<LaserLine> &laser_r,
                       const cv::Mat &rectify_l, const cv::Mat &rectify_r) {
 
+    // 0. 参数准备
     static const auto surfaces = ConfigManager::getInstance().getQuadSurfaces();
     const int P = static_cast<int>(surfaces.size());
     const auto& calib_info = ConfigManager::getInstance().getCalibInfo();
-    double baseline = 1 / calib_info.Q.at<double>(3, 2);
-    double fx_r = calib_info.P[1].at<double>(0, 0), fy_r = calib_info.P[1].at<double>(1, 1);
-    double cx_r = calib_info.P[1].at<double>(0, 2), cy_r = calib_info.P[1].at<double>(1, 2);
+    double fx_r = calib_info.P[1].at<double>(0, 0);
+    double baseline = std::abs(calib_info.P[1].at<double>(0, 3) / fx_r); 
 
-    // 1. 生成条带
+    // 1. 双向生成条带 (保留原有逻辑)
     std::vector<Band> bands_l = generateBands(laser_l, calib_info.P[0], rectify_l.rows);
     std::vector<Band> bands_r = generateBands(laser_r, calib_info.P[1], rectify_r.rows);
     int num_bands = std::min(bands_l.size(), bands_r.size());
@@ -56,29 +56,34 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
     cv::waitKey(1);
 #endif
 
-    // 2. 并行处理每一条带
     std::vector<MatchResult> all_results;
     std::mutex res_mutex;
+
+    // 2. 并行处理每一条带
     tbb::parallel_for(0, num_bands, [&](int b_idx) {
         const auto& band_l = bands_l[b_idx];
         const auto& band_r = bands_r[b_idx];
         int NL = band_l.slices.size();
         int NR = band_r.slices.size();
+        
+        // 如果任意一方没有切片，无法进行匹配
         if (NL == 0 || NR == 0) return;
 
         const float INF = 1e9f;
-        const float COST_THRESHOLD = 12.0f;  // 单切片有效匹配的阈值 (ScoreInfo.score)
-        const float COST_SKIP = 8.5f;      // 跳过一个切片(视为鬼影)的代价
+        const float COST_THRESHOLD = 8.5f;  // 单切片有效匹配的阈值
+        const float COST_SKIP = 10.0f;       // 跳过一个左切片(视为鬼影)的代价
 
-        // dp[i][j][k]
-        // i: 当前考虑到左切片 i (0..NL-1)
-        // j: 当前匹配到右切片 j (0..NR-1)
+        // DP 状态定义: dp[i][j][k]
+        // i: 当前左切片索引 (0..NL-1)
+        // j: 当前右切片索引 (0..NR-1)
         // k: 当前匹配光平面 k (0..P-1)
-        // 含义：L[i] 匹配 R[j] via P[k] 的最小代价
-        // 注意：这意味着 L[i] 必须匹配 R[j]。如果 L[i] 被跳过，则不在这个状态里，而是通过转移处理。
         std::vector<std::vector<std::vector<DpNode>>> dp(
             NL, std::vector<std::vector<DpNode>>(NR, std::vector<DpNode>(P, {INF, -1, -1, -1}))
         );
+
+        // === 初始化 (处理第0个左切片) ===
+        // 允许 L[0] 匹配 R[0...NR-1] 中的任意一个
+        // 隐含条件：R[0] 前面的右切片被跳过(不计代价)，L[0] 前面的左切片不存在
         for (int j = 0; j < NR; ++j) {
             for (int k = 0; k < P; ++k) {
                 auto info = computeCost(band_l.slices[0], band_r.slices[j], surfaces[k].coefficients, rectify_l, rectify_r);
@@ -89,89 +94,107 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
         }
 
         // === 状态转移 ===
-        for (int i = 1; i < NL; ++i) {
-            for (int j = 0; j < NR; ++j) {
-                for (int k = 0; k < P; ++k) {
+        for (int i = 1; i < NL; ++i) { // 遍历左切片
+            for (int j = 0; j < NR; ++j) { // 遍历右切片
+                for (int k = 0; k < P; ++k) { // 遍历光平面
                     
-                    // 1. 计算当前匹配代价 (L[i] <-> R[j] via P[k])
-                    // 这一步比较耗时，可以考虑加简单的几何预筛选
+                    // 1. 计算当前匹配代价
                     auto info = computeCost(band_l.slices[i], band_r.slices[j], surfaces[k].coefficients, rectify_l, rectify_r);
-                    if (info.score >= COST_THRESHOLD) continue;
+                    if (info.score >= COST_THRESHOLD) continue; // 剪枝
 
-                    float min_prev = INF;
-                    int best_l = -1, best_r = -1, best_p = -1;
+                    float min_prev_cost = INF;
+                    int best_pi = -1, best_pj = -1, best_pk = -1;
 
-                    // 2. 寻找前驱
-                    // Lookback L: 允许跳过左切片 (视为噪声)
-                    int lookback_l = std::max(0, i - 5);
+                    // -------------------------------------------------
+                    // 策略 A: 连接到前驱 (Link to Previous)
+                    // -------------------------------------------------
+                    
+                    // Lookback L: 允许回溯左切片 (跳过中间的噪声)
+                    int lookback_l = std::max(0, i - 5); 
                     
                     for (int pi = i - 1; pi >= lookback_l; --pi) {
                         float l_skip_penalty = (i - 1 - pi) * COST_SKIP;
                         
-                        // Delta L: 左边跨越了几个切片
-                        int delta_l = i - pi; // 最小为1 (相邻)
-                        
-                        // 【核心修改】应用右图切片跨度约束
-                        // 规则：总会预留 1 个位置 -> R_diff <= L_diff + 1
-                        // 比如 L 相邻 (diff=1)，R diff <= 2 (pj 可以是 j-1, j-2)
-                        int max_delta_r = delta_l + 1 ;
-                        
-                        // 计算 pj 的起始位置 (不能小于 0)
-                        int min_pj = std::max(0, j - max_delta_r);
-                        
-                        // Lookback R: 严格单调 pj < j
-                        for (int pj = min_pj; pj < j; ++pj) { 
+                        // Lookback R: 严格单调递增 (pj < j)
+                        // 优化：右切片一般不会跳跃太远，取前10个
+                        int lookback_r = std::max(0, j - 10);
+
+                        for (int pj = j - 1; pj >= lookback_r; --pj) {
                             
-                            // 检查光平面约束: pk <= k
-                            // 优化：同样可以限制 pk 的范围，比如 pk >= k-1
-                            for (int pk = 0; pk <= k; ++pk) {
+                            // Check 4 (Geometry): 几何比例约束 (带内弹性约束)
+                            float dist_L = band_l.slices[i]->center_pt.x - band_l.slices[pi]->center_pt.x;
+                            float dist_R = band_r.slices[j]->center_pt.x - band_r.slices[pj]->center_pt.x;
+                            
+                            // 物理合理性：X必须递增
+                            if (dist_L < 0.1f || dist_R < 0.1f) continue; 
+
+                            // 比例约束：防止将远距离的左切片匹配到近距离的右切片
+                            // float ratio = dist_R / dist_L;
+                            // if (ratio < 0.2f || ratio > 3.5f) continue; 
+
+                            // Lookback Plane: pk < k (严格单调，因为同一条带内不允许重复匹配平面)
+                            for (int pk = 0; pk < k; ++pk) {
                                 if (dp[pi][pj][pk].cost >= INF) continue;
+
+                                int p_diff = k - pk; // >= 1
+                                int l_idx_diff = i - pi;
+                                int r_idx_diff = j - pj;
+
+                                // Check 1 (Plane Monotonicity): 严格单调
+                                // 循环条件 pk < k 已经保证了 p_diff >= 1
+
+                                // Check 3 (Left Index Gap): 左图索引跨度约束
+                                // 允许跳过的平面数 <= 物理跳过的切片数 + 1
+                                if (p_diff > l_idx_diff + 1) continue;
+
+                                // Check New (Right Index Gap): 右图索引跨度约束
+                                // 右图同理，物理分布也限制了平面的跳跃
+                                if (p_diff > r_idx_diff + 1) continue;
 
                                 float total = dp[pi][pj][pk].cost + l_skip_penalty + info.score;
                                 
-                                // (可选) 加上右图跳过惩罚
-                                // int delta_r = j - pj;
-                                // total += (delta_r - 1) * 5.0f;
-
-                                if (total < min_prev) {
-                                    min_prev = total;
-                                    best_l = pi; best_r = pj; best_p = pk;
+                                if (total < min_prev_cost) {
+                                    min_prev_cost = total;
+                                    best_pi = pi; best_pj = pj; best_pk = pk;
                                 }
                             }
                         }
                     }
 
-                    // 3. 作为新起点 (Start Fresh)
-                    // 只有当 j 比较小的时候才允许作为起点，防止在很后面突然断开重连
-                    // 或者加上右图跳过的代价
-                    if (j < 5) { 
-                        float start_cost = i * COST_SKIP + info.score; // + j * R_SKIP
-                        if (start_cost < min_prev) {
-                            min_prev = start_cost;
-                            best_l = -1; best_r = -1; best_p = -1;
+                    // -------------------------------------------------
+                    // 策略 B: 作为新起点 (Start Fresh)
+                    // -------------------------------------------------
+                    // 假设 0...i-1 的左切片全是噪声，当前匹配为第一对有效匹配
+                    // 限制 j 的范围，防止从右图很靠后的位置突然开始
+                    if (j < 6) { 
+                        float start_cost = i * COST_SKIP + info.score;
+                        if (start_cost < min_prev_cost) {
+                            min_prev_cost = start_cost;
+                            best_pi = -1; best_pj = -1; best_pk = -1;
                         }
                     }
 
-                    if (min_prev < INF) {
-                        dp[i][j][k] = {min_prev, best_l, best_r, best_p};
+                    // 更新状态
+                    if (min_prev_cost < INF) {
+                        dp[i][j][k] = {min_prev_cost, best_pi, best_pj, best_pk};
                     }
                 }
             }
         }
 
-        // === 回溯 ===
-        float min_end = INF;
+        // === 回溯 (Backtracking) ===
+        float min_end_cost = INF;
         int ei = -1, ej = -1, ek = -1;
 
-        // 寻找最优终点 (考虑最后几个左切片被跳过)
+        // 寻找最优终点 (允许最后几个左切片被跳过)
         for (int i = 0; i < NL; ++i) {
             float tail_penalty = (NL - 1 - i) * COST_SKIP;
             for (int j = 0; j < NR; ++j) {
                 for (int k = 0; k < P; ++k) {
                     if (dp[i][j][k].cost < INF) {
                         float final_c = dp[i][j][k].cost + tail_penalty;
-                        if (final_c < min_end) {
-                            min_end = final_c;
+                        if (final_c < min_end_cost) {
+                            min_end_cost = final_c;
                             ei = i; ej = j; ek = k;
                         }
                     }
@@ -182,12 +205,13 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
         // 路径重建
         std::vector<MatchResult> local_res;
         while (ei != -1) {
-            // 重新计算一下 info 用于保存
+            // 需要重新计算/获取 info (实际工程中可在DP Node里存info或另开Cost表)
             auto info = computeCost(band_l.slices[ei], band_r.slices[ej], surfaces[ek].coefficients, rectify_l, rectify_r);
             
             MatchResult res;
-            res.l_slice_id = band_l.slices[ei]->id;       // 左切片全局ID
-            res.r_slice_id = band_r.slices[ej]->id;     // 右切片全局ID
+            res.band_id = band_l.idx;
+            res.l_slice_id = band_l.slices[ei]->id;
+            res.r_slice_id = band_r.slices[ej]->id;
             res.l_idx = band_l.slices[ei]->laser_idx;
             res.r_idx = band_r.slices[ej]->laser_idx;
             res.p_idx = ek;
@@ -205,6 +229,8 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
             all_results.insert(all_results.end(), local_res.begin(), local_res.end());
         }
     });
+
+    // filterMatches(all_results, bands_l, bands_r);
 
 #ifdef DEBUG_REGION
     int w = rectify_l.cols; 
@@ -224,8 +250,8 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
     for(const auto& res : all_results) {
         l_map[res.l_slice_id] = &res;
         r_map[res.r_slice_id] = &res;
-        // printf("slice L_ID=%d-R_ID=%d-P_ID=%d | Score=%.2f, dis_mean=%.2f, dis_mode=%.2f, dis_stddev=%.2f, norm_census=%.2f\n",
-        //        res.l_slice_id, res.r_slice_id, res.p_idx, res.info.score, res.info.dis_mean, res.info.dis_mode, res.info.dis_stddev, res.info.norm_census);
+        printf("slice L_ID=%d-R_ID=%d-P_ID=%d | Score=%.2f, dis_mean=%.2f, dis_mode=%.2f, dis_stddev=%.2f, norm_census=%.2f\n",
+               res.l_slice_id, res.r_slice_id, res.p_idx, res.info.score, res.info.dis_mean, res.info.dis_mode, res.info.dis_stddev, res.info.norm_census);
     }
 
     // 绘制左图
@@ -239,7 +265,10 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
             for(const auto& p : s->pts) cv::circle(canvas, cv::Point(p.x, p.y), 1, color, -1);
             
             // 显示 L_ID
-            cv::putText(canvas, std::to_string(s->id), cv::Point2f(s->center_pt.x+13, s->center_pt.y), cv::FONT_HERSHEY_SIMPLEX, 0.6, {255,255,255}, 1);
+            cv::putText(canvas, std::to_string(s->laser_idx) + "-" + std::to_string(s->id),
+                        cv::Point2f(s->center_pt.x+13, s->center_pt.y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, {255,255,255}, 1
+                    );
         }
     }
 
@@ -253,7 +282,7 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
                 for(const auto& p : s->pts) cv::circle(canvas, cv::Point(p.x + w, p.y), 1, color, -1);
                 
                 // 显示 R_ID (L_ID)
-                std::string txt = std::to_string(res->p_idx) + "<-" + std::to_string(res->l_slice_id);
+                std::string txt = std::to_string(res->r_idx) + "-" + std::to_string(res->p_idx) + "-" + std::to_string(res->l_slice_id);
                 cv::putText(canvas, txt, cv::Point(s->center_pt.x + w + 13, s->center_pt.y), cv::FONT_HERSHEY_SIMPLEX, 0.6, {255,255,255}, 1);
             }
         }
@@ -267,7 +296,141 @@ MatchProcessor::match(const std::vector<LaserLine> &laser_l,
     cv::waitKey(0);
 #endif
 
+
     return all_results;
+}
+
+void MatchProcessor::filterMatches(
+    std::vector<MatchResult>& matches,
+    const std::vector<Band>& bands_l,
+    const std::vector<Band>& bands_r) 
+{
+    if (matches.empty()) return;
+
+    // =========================================================
+    // Pass 1: 基于左连通域 (Left Laser) 修复光平面跳变
+    // 覆盖 ABA (中间) 和 AAAB (尾部) 模式
+    // =========================================================
+    
+    // 1. 分组：按左线 ID (l_idx)
+    std::map<int, std::vector<MatchResult*>> l_groups;
+    for (auto& m : matches) {
+        if (m.l_idx != -1) l_groups[m.l_idx].push_back(&m);
+    }
+
+    for (auto& [l_id, group] : l_groups) {
+        if (group.empty()) continue;
+
+        // 2. 排序：确保按条带空间顺序 (Band ID)
+        std::sort(group.begin(), group.end(), [](MatchResult* a, MatchResult* b) {
+            return a->band_id < b->band_id;
+        });
+
+        // 3. RLE 分析光平面 ID (p_idx)
+        std::vector<Run> runs;
+        int curr_p = group[0]->p_idx;
+        int curr_start = 0;
+        int curr_len = 1;
+
+        for (size_t i = 1; i < group.size(); ++i) {
+            if (group[i]->p_idx == curr_p) {
+                curr_len++;
+            } else {
+                runs.push_back({curr_p, curr_start, curr_len});
+                curr_p = group[i]->p_idx;
+                curr_start = static_cast<int>(i);
+                curr_len = 1;
+            }
+        }
+        runs.push_back({curr_p, curr_start, curr_len});
+
+        // 4. 检测并修复异常模式
+        for (size_t i = 0; i < runs.size(); ++i) {
+            bool need_fix = false;
+            int target_run_idx = -1; // 指向参考段 (A) 的 run 索引
+
+            // 必须有前驱节点才能修复 (A 在前)
+            if (i > 0) {
+                Run& prev = runs[i-1];
+                Run& curr = runs[i];
+
+                // 情况 A: ABA 模式 (中间段)
+                // 条件: 前后光平面一致 且 当前长度 < 2 (即只有1个点)
+                if (i < runs.size() - 1) {
+                    Run& next = runs[i+1];
+                    if (prev.p_idx == next.p_idx && curr.len < 2) {
+                        need_fix = true;
+                        target_run_idx = static_cast<int>(i - 1); // 参考前一段 A
+                    }
+                }
+
+                // 情况 B: AAAB 模式 (尾段)
+                // 条件: 是最后一个段 且 当前长度 < 3 (长度1或2)
+                if (!need_fix && i == runs.size() - 1) {
+                    if (curr.len < 3) {
+                        need_fix = true;
+                        target_run_idx = static_cast<int>(i - 1); // 参考前一段 A
+                    }
+                }
+            }
+
+            // 执行修复逻辑
+            if (need_fix && target_run_idx != -1) {
+                Run& target_run = runs[target_run_idx]; // 这是参考段 A
+                Run& curr_run = runs[i];                // 这是待修复段 B
+
+                // === 核心修改：计算参考段 A 中 r_idx 的众数 ===
+                std::unordered_map<int, int> r_idx_counts;
+                for (int k = target_run.start_idx; k < target_run.start_idx + target_run.len; ++k) {
+                    int rid = group[k]->r_idx;
+                    if (rid != -1) {
+                        r_idx_counts[rid]++;
+                    }
+                }
+
+                int target_r_idx = -1;
+                int max_freq = -1;
+                for (const auto& [rid, count] : r_idx_counts) {
+                    if (count > max_freq) {
+                        max_freq = count;
+                        target_r_idx = rid;
+                    }
+                }
+
+                // 如果参考段有效 (找到了众数)，则进行修复
+                if (target_r_idx != -1) {
+                    int target_p_idx = target_run.p_idx; // 目标光平面即 A 的光平面
+
+                    for (int k = curr_run.start_idx; k < curr_run.start_idx + curr_run.len; ++k) {
+                        MatchResult* m = group[k];
+                        
+                        // 利用 条带+laser 确定唯一的切片
+                        const Band& band = bands_r[m->band_id];
+                        auto it = band.laser2slice.find(target_r_idx);
+
+                        if (it != band.laser2slice.end()) {
+                            // 找到目标切片，执行修正
+                            m->r_idx = target_r_idx;
+                            m->r_slice_id = it->second->id; // 获取 Slice指针 后取 id
+                            m->p_idx = target_p_idx;        // 修正为 A 的光平面
+                        } else {
+                            // 目标右线在该条带无切片（物理断裂），标记无效
+                            m->r_idx = -1; 
+                            m->l_idx = -1; 
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================
+    // Pass 3 (Cleanup): 物理移除无效匹配
+    // =========================================================
+    matches.erase(
+        std::remove_if(matches.begin(), matches.end(), 
+            [](const MatchResult& m) { return m.r_idx == -1; }),
+        matches.end());
 }
 
 std::vector<cv::Point3f>
@@ -315,7 +478,6 @@ MatchProcessor::findIntersection(const cv::Point3f &point,
 
   return intersections;
 }
-
 
 int MatchProcessor::computeCensus(const cv::Mat& img1, const cv::Point2f& pt1,
                          const cv::Mat& img2, const cv::Point2f& pt2, int window_size) {
@@ -454,6 +616,9 @@ std::vector<Band> MatchProcessor::generateBands(const std::vector<LaserLine>& la
         }
     }
 
+    // 构建查找表
+    for(auto& b : bands) b.buildLaserToSlice();
+
     return bands;
 }
 
@@ -578,9 +743,9 @@ ScoreInfo MatchProcessor::computeCost(const Slice* slice_l, const Slice* slice_r
     info.norm_census = (float)total_census / indices.size();
 
     // 最终代价聚合
-    float w_mode = 1.0f;   // 几何精度（众数距离）
-    float w_std = 0.5f;    // 几何一致性（标准差）
-    float w_cen = 0.2f;    // 纹理代价
+    float w_mode = 0.75f;   // 几何精度（众数距离）
+    float w_std = 1.2f;    // 几何一致性（标准差）
+    float w_cen = 1.0f;    // 纹理代价
 
     info.score = w_mode * info.dis_mode + 
                  w_std * info.dis_stddev + 
