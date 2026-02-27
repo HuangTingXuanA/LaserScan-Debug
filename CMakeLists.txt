@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(LaserCalib LANGUAGES C CXX CUDA)
+project(LaserMatch LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 

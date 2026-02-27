@@ -67,11 +67,15 @@ static cv::Mat generateInspectImg(
 
     const auto& line = laser_l[target_l_id];
 
-    // 用 cv::circle 绘制左线（白色，半径 2，易于观察）
+
+    // 用 .at 绘制左线（亮黄色，上下各扩展1像素增强可见度）
     for (size_t i = 0; i < line.size(); ++i) {
         int x = cvRound(line.points[i].x), y = cvRound(line.y_coords[i]);
-        if (x >= 1 && x < rectify_l.cols-1 && y >= 1 && y < rectify_l.rows-1)
-            cv::circle(canvas, cv::Point(x, y), 2, cv::Scalar(255,255,255), -1, cv::LINE_AA);
+        for (int dy = -1; dy <= 1; ++dy) {
+            int yy = y + dy;
+            if (x >= 0 && x < rectify_l.cols && yy >= 0 && yy < rectify_l.rows)
+                canvas.at<cv::Vec3b>(yy, x) = cv::Vec3b(0, 255, 255);
+        }
     }
 
     // 调色板（每个光曲面一种颜色）
@@ -86,7 +90,6 @@ static cv::Mat generateInspectImg(
         const auto& coef = planes[p_idx].coefficients;
         cv::Scalar col = palette[p_idx % palette.size()];
 
-        // 重投影点列表（用于绘制连线和找中心）
         std::vector<cv::Point2f> reproj_pts;
 
         for (size_t i = 0; i < line.size(); ++i) {
@@ -106,11 +109,11 @@ static cv::Mat generateInspectImg(
                 reproj_pts.emplace_back(xr + off, yr);
         }
 
-        // 用 cv::circle 绘制重投影点（半径 2）
+        // 用 .at 绘制重投影点（单像素）
         for (auto& p : reproj_pts) {
             int px = cvRound(p.x), py = cvRound(p.y);
-            if (px >= 1 && px < canvas.cols-1 && py >= 1 && py < canvas.rows-1)
-                cv::circle(canvas, cv::Point(px, py), 2, col, -1, cv::LINE_AA);
+            if (px >= 0 && px < canvas.cols && py >= 0 && py < canvas.rows)
+                canvas.at<cv::Vec3b>(py, px) = cv::Vec3b((uchar)col[0], (uchar)col[1], (uchar)col[2]);
         }
 
         // 在重投影线中心标注曲面 ID
@@ -278,7 +281,6 @@ int main(int argc, char* argv[]) {
             }
         }
     }
-
-    printf("\n处理完成。\n");
+    
     return 0;
 }
